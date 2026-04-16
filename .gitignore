@@ -1,0 +1,46 @@
+# Environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Claude configuration/history
+.claude/
+CLAUDE.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Logs & runtime state
+logs/
+*.log
+bot.pid
+HALT
+
+# Data / databases (user trading state)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/bond_bot_backup_*.db
+data/paper_trade.db
+
+# Analysis reports (may contain live wallet/trade data)
+reports/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

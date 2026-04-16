@@ -1,0 +1,193 @@
+wallet:
+  signature_type: 1
+
+paper_balance: 1000
+
+scanner:
+  scan_interval_seconds: 300
+  min_entry_price: 0.94             # P1: Tightened from 0.90 — $0.90-0.93 are junk bonds
+  max_entry_price: 0.975             # V3: Drop $0.98-$0.99 band — net-negative in paper trading
+  max_days_to_resolution: 14
+  preferred_resolution_hours: 72
+  min_liquidity: 5000
+  min_volume_24h: 2500
+  max_price_volatility_1d: 0.05
+  volume_trend_min_ratio: 0.70      # P1: 24h volume must be >= 70% of 7d daily avg
+  time_filter_weekend_multiplier: 2.0  # P3: Liquidity multiplier on weekends
+  time_filter_offpeak_multiplier: 1.5  # P3: Liquidity multiplier off-peak hours
+  excluded_categories:
+    - "15-min Crypto"
+    - "1-hr Crypto"
+    - "Live Sports"
+    - "Sports"
+    - "E-Sports"
+    - "Esports"
+
+risk:
+  max_single_market_pct: 0.06        # V3: Hard cap 6% (was 12%)
+  target_position_pct: 0.04          # V3: Target 4% (was 8%) — ~quarter Kelly for n=18
+  max_correlated_pct: 0.25          # Max 25% in same event group
+  max_category_exposure_pct: 0.35   # Max 35% in same Polymarket category
+  max_deployed_pct: 0.80            # Max 80% total deployment
+  max_absolute_position: 5000       # Hard cap in USDC
+  max_daily_loss_pct: 0.05          # Halt new entries if daily losses >= 5%
+  consecutive_loss_halt: 5          # P1: Reduced from 8 — triggers earlier to limit damage
+  consecutive_loss_cooldown_hours: 6 # Resume trading after N hours of circuit breaker
+  max_slippage_pct: 0.03            # Reject if estimated entry slippage > 3%
+  volume_size_max_pct: 0.05         # Max 5% of 24h volume per position (A5)
+  min_viable_position: 15           # Minimum position worth taking (USDC)
+  min_net_yield: 0.015              # V3: Raised from 0.008 — require 1.5% min yield after fees
+
+exits:
+  # Stop loss
+  stop_loss_pct: 0.10               # Default stop-loss (overridden by tiered below)
+  stop_loss_urgency: "immediate"    # Always use market order for stop-loss
+
+  # Tiered stop-loss: INVERTED curve — tighter stops on riskier lower-entry bonds (V3)
+  tiered_stop_loss:
+    - min_entry: 0.98
+      stop_loss_pct: 0.05    # Wide — high confidence, thin margin anyway
+    - min_entry: 0.96
+      stop_loss_pct: 0.04    # Moderate — sweet-spot band
+    - min_entry: 0.94
+      stop_loss_pct: 0.03    # Tight — lower confidence, protect capital
+    - min_entry: 0.90
+      stop_loss_pct: 0.025   # Tightest — if wrong at $0.90, get out fast
+
+  # Take profit (bond-specific)
+  bond_take_profit_price: 0.995     # Consider early exit when price >= $0.995
+  bond_take_profit_min_hours_to_resolution: 48  # Only if resolution > 48h away
+  generic_take_profit_pct: 0.10     # 10% take-profit for non-bond positions
+
+  # Time-based exit
+  max_holding_days: 14              # Default max holding (dynamic extension up to 14 for known resolutions)
+  stale_resolution_hours: 48        # Flag if resolution date passed by >48h
+
+  # Partial scaling (default OFF for bond strategy)
+  partial_scaling_enabled: false
+  partial_close_trigger_pct: 0.08   # Close 50% at +8%
+  partial_close_pct: 0.50
+  partial_remainder_target_pct: 0.15
+
+  # Portfolio-level exits
+  portfolio_drawdown_alert_pct: 0.05    # Close worst position at -5% drawdown
+  portfolio_drawdown_critical_pct: 0.08 # Close bottom 3 positions at -8%
+  portfolio_profit_taking_enabled: false
+  portfolio_profit_taking_pct: 0.03
+
+  # Trailing stop (A6 — activates near resolution price)
+  trailing_stop_activation_price: 0.995  # Activate when price >= this
+  trailing_stop_distance_pct: 0.005      # Trail 0.5% below high-water mark
+
+  # P2: Post-entry re-validation interval
+  revalidation_interval_hours: 4
+
+  # Legacy fields (used by monitor.py for supplemental alert notifications)
+  auto_exit_enabled: true
+  yellow_alert_threshold: 0.85
+  orange_alert_threshold: 0.80
+  red_alert_exit_threshold: 0.75
+  order_timeout_seconds: 300
+
+# Alert thresholds (notifications only — not exit triggers)
+alerts:
+  yellow_loss_pct: 0.05             # Notification at 5% loss
+  orange_loss_pct: 0.08             # Notification at 8% loss
+
+# Risk bucket caps for correlation clustering (A4)
+risk_buckets:
+  politics:
+    max_bucket_exposure_pct: 0.30
+  crypto:
+    max_bucket_exposure_pct: 0.30
+  macro:
+    max_bucket_exposure_pct: 0.30
+  sports:
+    max_bucket_exposure_pct: 0.25
+  culture:
+    max_bucket_exposure_pct: 0.20
+  science_tech:
+    max_bucket_exposure_pct: 0.25
+  other:
+    max_bucket_exposure_pct: 0.20
+
+orderbook:
+  min_bid_depth_multiplier: 3
+  max_spread: 0.04
+  max_bid_volume_decline_pct: 0.30
+
+notifications:
+  enabled: true
+  webhook_url: ""
+  alert_on_trade: true
+  alert_on_warning: true
+  alert_on_error: true
+  daily_summary: true
+  performance_summary: true
+  performance_summary_hour_utc: 0   # Hour of day (UTC) to send lifetime summary
+
+# P0: Teleportation slippage protection
+teleportation:
+  teleportation_max_loss_pct: 0.50        # Absolute max loss before forced market exit
+  teleportation_detection_multiplier: 2.0  # drop > stop_loss * this = teleportation
+  teleportation_exit_slippage_pct: 0.10    # Wider slippage band for teleport exits
+
+# P0: Orderbook imbalance monitor (live mode only)
+orderbook_monitor:
+  orderbook_monitor_interval_seconds: 20
+  warning_bid_depth_ratio: 2.0
+  critical_bid_depth_ratio: 1.0
+  exit_bid_depth_ratio: 0.5
+  bid_wall_pull_threshold: 0.30
+
+# P1: Binary catalyst classification
+binary_catalyst:
+  binary_catalyst_reject_threshold: 0.85
+  binary_catalyst_penalize_threshold: 0.50
+  binary_catalyst_penalty_factor: 0.60
+
+# P1: Price drop cool-down
+detector:
+  price_drop_cooldown_threshold: -0.03
+  price_drop_recovery_ratio: 0.80
+  min_parity_sum: 0.96
+  max_parity_sum: 1.04
+
+# P2: Adaptive position sizing
+adaptive_sizing:
+  enabled: true
+  min_size_pct: 0.05
+  max_size_pct: 0.10
+
+# P2: Blacklist learning loop
+blacklist_learner:
+  enabled: true
+  loss_threshold: 3
+  window_days: 30
+
+# P3: Resolution proximity scoring
+scoring:
+  resolution_proximity_decay_rate: 0.3
+  use_exponential_proximity: true
+
+# Feature flags — set false to disable without code changes
+feature_flags:
+  teleportation_detection: true
+  orderbook_monitor: true
+  binary_catalyst_filter: true
+  volume_trend_filter: true
+  price_drop_cooldown: true
+  adaptive_sizing: true
+  secondary_price_validation: true
+  post_entry_revalidation: true
+  blacklist_learner: true
+  exit_fee_optimization: true
+  time_of_day_filter: true
+  exponential_proximity: true
+
+logging:
+  level: INFO
+  file: "logs/bond_bot.log"
+  max_size_mb: 50
+  backup_count: 5
+  db_path: "data/bond_bot.db"
