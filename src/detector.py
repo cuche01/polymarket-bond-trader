@@ -15,7 +15,14 @@ except ImportError:
     aiohttp = None  # type: ignore
 
 from .risk_buckets import RiskBucketClassifier
-from .utils import feature_enabled, get_days_to_resolution, safe_json_parse
+from .utils import (
+    estimate_round_trip_fee_rate,
+    feature_enabled,
+    get_days_to_resolution,
+    resolve_fee_schedule,
+    safe_json_parse,
+    shadow_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +62,8 @@ class PseudoCertaintyDetector:
 
         risk_cfg = config.get("risk", {})
         self.min_net_yield = risk_cfg.get("min_net_yield", 0.01)
+        # V4 Phase 2.1: Category-specific min net yield map.
+        self.min_net_yield_by_category = risk_cfg.get("min_net_yield_by_category", {}) or {}
 
         # Live-event gate: reject sports markets that resolve within this window
         # to prevent in-play entries (which are exposed to unrecoverable gap-downs).
@@ -94,6 +103,23 @@ class PseudoCertaintyDetector:
         except (json.JSONDecodeError, IOError) as e:
             logger.error(f"Failed to load blacklist: {e}")
             return {"market_ids": [], "slugs": [], "keyword_patterns": [], "categories": []}
+
+    def _resolve_category_min_yield(self, category: str) -> Optional[float]:
+        """V4 Phase 2.1: look up the category-specific min net yield.
+
+        Returns the category override, the `_unknown` default, or None when no
+        map is configured. Overrides are clamped at `min_net_yield - 0.005` —
+        a hard floor to prevent misconfiguration from accepting junk yields.
+        """
+        if not self.min_net_yield_by_category:
+            return None
+        value = self.min_net_yield_by_category.get(category)
+        if value is None:
+            value = self.min_net_yield_by_category.get("_unknown")
+        if value is None:
+            return None
+        hard_floor = self.min_net_yield - 0.005
+        return max(float(value), hard_floor)
 
     async def _get_session(self):
         """Get or create HTTP session."""
@@ -628,14 +654,51 @@ class PseudoCertaintyDetector:
             logger.debug(f"Layer 5 rejected: {reason}")
             return False, f"[L5] {reason}"
 
-        # Final yield check
+        # Final yield check (V4 1.2: dynamic fees from feeSchedule)
         yes_price = market.get("_yes_price", 0)
         if yes_price > 0:
             gross_yield = (1.0 - yes_price) / yes_price
-            # Assume ~0.1% fees
-            net_yield = gross_yield - 0.001
+            fees_cfg = self.config.get("fees", {}) or {}
+            fee_schedule = resolve_fee_schedule(market, fees_cfg)
+            market["_fee_schedule"] = fee_schedule
+            round_trip_fee = estimate_round_trip_fee_rate(
+                entry_price=yes_price,
+                exit_price=None,
+                fee_schedule=fee_schedule,
+                entry_is_maker=bool(fees_cfg.get("assume_entry_maker", True)),
+                exit_is_taker=bool(fees_cfg.get("assume_exit_taker", True)),
+                exit_is_resolution=False,  # conservative: assume early taker exit
+            )
+            net_yield = gross_yield - round_trip_fee
+            market["_estimated_round_trip_fee_rate"] = round_trip_fee
+
+            # V4 Phase 2.1: Category-specific min net yield.
+            category = market.get("category") or market.get("marketType") or "_unknown"
+            category_min = self._resolve_category_min_yield(category)
+            enforce_category = feature_enabled(self.config, "category_min_yield")
+            shadow_category = shadow_enabled(self.config, "category_min_yield")
+
+            # Primary (global) gate always enforces.
             if net_yield < self.min_net_yield:
-                return False, f"Net yield {net_yield:.4f} below minimum {self.min_net_yield}"
+                return False, (
+                    f"Net yield {net_yield:.4f} below minimum {self.min_net_yield} "
+                    f"(fee_rate={round_trip_fee:.4f})"
+                )
+
+            # Category-specific gate: enforce only when the real flag is on.
+            if category_min is not None and net_yield < category_min:
+                if enforce_category:
+                    return False, (
+                        f"Net yield {net_yield:.4f} below {category} minimum "
+                        f"{category_min:.4f} (fee_rate={round_trip_fee:.4f})"
+                    )
+                if shadow_category:
+                    detail = (
+                        f"category={category} min={category_min:.4f} "
+                        f"actual={net_yield:.4f}"
+                    )
+                    market["_shadow_reject_category_min_yield"] = detail
+                    logger.info(f"[SHADOW category_min_yield] would reject: {detail}")
 
         market_question = market.get("question") or market.get("title") or "Unknown"
         logger.info(f"Market PASSED all layers: {market_question[:60]}")

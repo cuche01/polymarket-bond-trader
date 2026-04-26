@@ -137,6 +137,21 @@ class Database:
 
                 CREATE INDEX IF NOT EXISTS idx_bl_learning_lookup
                     ON blacklist_learning(feature_type, feature_value, loss_time);
+
+                CREATE TABLE IF NOT EXISTS pipeline_health (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    scan_time TEXT NOT NULL,
+                    candidates_fetched INTEGER NOT NULL,
+                    candidates_passed_prefilter INTEGER NOT NULL,
+                    candidates_passed_detector INTEGER NOT NULL,
+                    candidates_passed_risk_engine INTEGER NOT NULL,
+                    entries_executed INTEGER NOT NULL,
+                    rejection_reasons_json TEXT,
+                    mode TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_pipeline_health_time
+                    ON pipeline_health(scan_time);
             """)
         self._migrate_schema()
         logger.info(f"Database initialized at {self.db_path}")
@@ -169,6 +184,20 @@ class Database:
             ("positions", "binary_catalyst_score", "REAL DEFAULT 0.0"),
             # P2: Re-validation
             ("positions", "last_revalidation_time", "TEXT"),
+            # V4 1.2: Dynamic fee model
+            ("positions", "fee_schedule_json", "TEXT"),
+            ("positions", "estimated_entry_fee", "REAL DEFAULT 0"),
+            ("positions", "estimated_exit_fee", "REAL DEFAULT 0"),
+            ("positions", "actual_entry_fee", "REAL"),
+            ("positions", "actual_exit_fee", "REAL"),
+            # V4 Phase 2.3: Holding rewards (4% APY on eligible positions).
+            ("positions", "holding_rewards_enabled", "INTEGER DEFAULT 0"),
+            ("positions", "holding_rewards_apr", "REAL DEFAULT 0"),
+            ("positions", "estimated_holding_rewards", "REAL DEFAULT 0"),
+            ("positions", "actual_holding_rewards", "REAL"),
+            # V4 Phase 2.5: LP rewards (ranking signal; not auto-claimed).
+            ("positions", "lp_rewards_enabled", "INTEGER DEFAULT 0"),
+            ("positions", "lp_rewards_daily_rate", "REAL DEFAULT 0"),
             # Rejected markets catalyst columns
             ("rejected_markets", "catalyst_type", "TEXT"),
             ("rejected_markets", "binary_catalyst_score", "REAL"),
@@ -215,8 +244,9 @@ class Database:
                     cost_basis, entry_time, expected_resolution, status,
                     fees_paid, bond_score, paper_trade, order_id, event_id,
                     category, event_group_id, risk_bucket, original_shares,
-                    capital_state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    capital_state, fee_schedule_json,
+                    estimated_entry_fee, estimated_exit_fee
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     position.get("market_id", ""),
@@ -238,6 +268,9 @@ class Database:
                     position.get("risk_bucket", "other"),
                     position.get("shares", 0.0),  # original_shares = initial shares
                     position.get("capital_state", "deployed"),
+                    position.get("fee_schedule_json"),
+                    position.get("estimated_entry_fee", 0.0),
+                    position.get("estimated_exit_fee", 0.0),
                 ),
             )
             row_id = cursor.lastrowid
@@ -265,6 +298,12 @@ class Database:
             "teleportation_flag", "orderbook_exit_flag",
             "catalyst_type", "binary_catalyst_score",
             "last_revalidation_time",
+            "fee_schedule_json", "estimated_entry_fee", "estimated_exit_fee",
+            "actual_entry_fee", "actual_exit_fee",
+            # V4 Phase 2.3/2.5: rewards columns.
+            "holding_rewards_enabled", "holding_rewards_apr",
+            "estimated_holding_rewards", "actual_holding_rewards",
+            "lp_rewards_enabled", "lp_rewards_daily_rate",
         }
         filtered = {k: v for k, v in updates.items() if k in allowed_fields}
         if not filtered:
@@ -305,6 +344,48 @@ class Database:
                     (1 if paper_trade else 0,),
                 )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_resolution_date_exposure(
+        self,
+        resolution_time_iso: str,
+        window_hours: float = 24.0,
+        paper_trade: Optional[bool] = None,
+    ) -> float:
+        """V4 Phase 2.4: sum cost_basis of open positions whose
+        `expected_resolution` falls within ±window_hours of the given time.
+
+        Used by the resolution-date cluster check to prevent >25% of deployed
+        capital from resolving in any single 24h window (same-catalyst
+        correlation risk). Positions with unparseable or missing resolution
+        times are skipped (logged upstream).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        try:
+            target = datetime.fromisoformat(resolution_time_iso.replace("Z", "+00:00"))
+        except (ValueError, AttributeError):
+            return 0.0
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+
+        half = timedelta(hours=window_hours / 2.0)
+        lo, hi = target - half, target + half
+
+        positions = self.get_open_positions(paper_trade=paper_trade)
+        exposure = 0.0
+        for pos in positions:
+            iso = pos.get("expected_resolution") or ""
+            if not iso:
+                continue
+            try:
+                t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            if lo <= t <= hi:
+                exposure += float(pos.get("cost_basis") or 0.0)
+        return exposure
 
     def get_all_positions(
         self,

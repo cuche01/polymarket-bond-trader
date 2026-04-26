@@ -30,6 +30,7 @@ from src.exit_engine import ExitEngine
 from src.monitor import PositionMonitor
 from src.notifications import Notifier
 from src.orderbook_monitor import OrderbookMonitor
+from src.pipeline_health import PipelineHealth
 from src.portfolio_manager import PortfolioManager
 from src.risk_engine import RiskEngine
 from src.scanner import MarketScanner
@@ -89,6 +90,11 @@ class BondBot:
         )
         self.orderbook_monitor = OrderbookMonitor(config, self.notifier)
         self.blacklist_learner = BlacklistLearner(self.db, config)
+
+        # V4 1.1: Pipeline health monitor — records per-scan funnel, detects
+        # starvation (see pipeline_health.yaml config section).
+        self.pipeline_health = PipelineHealth(config, self.db)
+        self._last_starvation_severity: str = "OK"
 
         # CLOB client (initialized in startup)
         self.clob_client: Optional[Any] = None
@@ -240,6 +246,18 @@ class BondBot:
         scan_start = time.time()
         trades_executed = 0
         error_message = None
+        # V4 1.1: Track per-stage funnel counts for pipeline_health
+        passed_detector = 0
+        passed_risk_engine = 0
+        rejection_reasons: Dict[str, int] = {}
+
+        def _tally(reason_code: str) -> None:
+            rejection_reasons[reason_code] = rejection_reasons.get(reason_code, 0) + 1
+
+        # V4 Phase 2 fix: reset risk-engine shadow counters at scan start so
+        # main.py can merge this cycle's signals into pipeline_health later.
+        if hasattr(self.risk_engine, "shadow_signals"):
+            self.risk_engine.shadow_signals.clear()
 
         try:
             logger.info("Starting scan cycle...")
@@ -289,6 +307,7 @@ class BondBot:
 
                 if not is_valid:
                     logger.debug(f"Market rejected: {reason}")
+                    _tally(f"detector:{reason.split(':')[0][:40]}")
                     self.db.log_rejection(
                         market_id=market_id,
                         market_question=market.get("question") or market.get("title", "")[:200],
@@ -299,6 +318,13 @@ class BondBot:
                         days_to_resolution=market.get("_days_to_resolution", 0),
                     )
                     continue
+                passed_detector += 1
+
+                # V4 Phase 2 fix: tally detector shadow signals so they flow
+                # into pipeline_health.rejection_reasons_json instead of only
+                # living on the market dict.
+                if market.get("_shadow_reject_category_min_yield"):
+                    _tally("detector:shadow_category_min_yield")
 
                 # Initial position size from target percentage
                 position_size = self.portfolio_balance * target_pct
@@ -317,11 +343,18 @@ class BondBot:
                     clob_client=self.clob_client,
                     token_id=market.get("_yes_token_id"),
                     days_to_resolution=market.get("_days_to_resolution", 7.0),
+                    market_resolution_time=(
+                        market.get("endDate")
+                        or market.get("end_date_iso")
+                        or market.get("gameStartTime")
+                    ),
                 )
 
                 if not approved:
                     logger.info(f"Entry blocked by risk engine: {approval_reason}")
+                    _tally(f"risk:{approval_reason.split(':')[0][:40]}")
                     continue
+                passed_risk_engine += 1
 
                 # Execute order
                 position = await self.executor.execute_entry(
@@ -375,6 +408,53 @@ class BondBot:
                 scan_duration_ms=scan_duration_ms,
                 error_message=error_message,
             )
+
+            # V4 1.1: Record per-scan funnel for pipeline_health + starvation check
+            try:
+                scanner_metrics = getattr(self.scanner, "last_scan_metrics", {}) or {}
+                # V4 Phase 2 fix: merge scanner prefilter rejections (including
+                # shadow_category_band_rescue) into rejection_reasons under a
+                # `scanner:` namespace so they show up in pipeline_health.
+                prefilter_rej = scanner_metrics.get("prefilter_rejections") or {}
+                for code, count in prefilter_rej.items():
+                    if not count:
+                        continue
+                    key = f"scanner:{code}"
+                    rejection_reasons[key] = rejection_reasons.get(key, 0) + int(count)
+                # V4 Phase 2 fix: merge risk-engine shadow counters likewise.
+                risk_shadows = getattr(self.risk_engine, "shadow_signals", {}) or {}
+                for code, count in risk_shadows.items():
+                    if not count:
+                        continue
+                    key = f"risk:shadow_{code}"
+                    rejection_reasons[key] = rejection_reasons.get(key, 0) + int(count)
+                self.pipeline_health.record_scan({
+                    "candidates_fetched": scanner_metrics.get("candidates_fetched", 0),
+                    "candidates_passed_prefilter": scanner_metrics.get(
+                        "candidates_passed_prefilter", len(self._candidates)
+                    ),
+                    "candidates_passed_detector": passed_detector,
+                    "candidates_passed_risk_engine": passed_risk_engine,
+                    "entries_executed": trades_executed,
+                    "rejection_reasons": rejection_reasons,
+                    "mode": "paper" if self.paper_mode else "live",
+                })
+                severity, action = self.pipeline_health.check_starvation()
+                if (
+                    severity in ("WARNING", "CRITICAL", "STARVATION")
+                    and severity != self._last_starvation_severity
+                ):
+                    dry = self.pipeline_health.get_dry_period_hours()
+                    top = self.pipeline_health.get_top_rejection_reasons(limit=3)
+                    reasons_str = ", ".join(f"{k}({v})" for k, v in top) or "none"
+                    await self.notifier.send_warning(
+                        f"Pipeline {severity}: no entries for {dry:.1f}h. "
+                        f"Top rejections: {reasons_str}",
+                        level="red" if severity == "STARVATION" else "orange",
+                    )
+                self._last_starvation_severity = severity
+            except Exception as e:
+                logger.error(f"pipeline_health recording failed: {e}")
 
         return trades_executed
 
@@ -437,6 +517,10 @@ class BondBot:
                         closed_pos = self.db.get_position_by_id(position.get("id"))
                         if closed_pos and closed_pos.get("pnl") is not None:
                             self.exit_engine.check_for_fluke_loss(position, closed_pos["pnl"])
+                        # V4 P1.5: Register underlying stop-out cooldown
+                        self.risk_engine.register_underlying_stopout(
+                            position.get("market_question") or ""
+                        )
                     # Flag teleportation exits in DB
                     if decision.reason.startswith("teleportation"):
                         self.db.update_position(position.get("id"), {"teleportation_flag": 1})
@@ -619,6 +703,13 @@ class BondBot:
             "portfolio_balance": self.portfolio_balance,
             "total_deployed": deployed,
         })
+
+        # V4 1.4: Pipeline-health summary (funnel + top rejection + dry period)
+        try:
+            health_summary = self.pipeline_health.get_24h_summary()
+            await self.notifier.send_pipeline_health_summary(health_summary)
+        except Exception as e:
+            logger.warning(f"Pipeline health summary failed: {e}")
 
         # Generate report for dashboard
         report = self.dashboard.generate_daily_report(self.db, paper_trade=self.paper_mode)

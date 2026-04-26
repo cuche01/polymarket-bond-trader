@@ -70,6 +70,20 @@ class PortfolioManager:
         """Sum of cost_basis for open positions in this risk bucket."""
         return self.db.get_risk_bucket_exposure(bucket_name, paper_trade=self._paper_mode)
 
+    def get_resolution_date_exposure(
+        self,
+        resolution_time_iso: str,
+        window_hours: float = 24.0,
+    ) -> float:
+        """V4 Phase 2.4: sum cost_basis of open positions resolving within
+        ±window_hours of the given time. Enables same-catalyst cluster check.
+        """
+        return self.db.get_resolution_date_exposure(
+            resolution_time_iso,
+            window_hours=window_hours,
+            paper_trade=self._paper_mode,
+        )
+
     # ─── P&L and loss tracking ────────────────────────────────────────────────
 
     def get_todays_realized_pnl(self) -> float:

@@ -1070,3 +1070,232 @@ At current rate of ~4 trades/day (likely increasing after $0.98 band removal
 frees pipeline capacity), reaching N=50 takes ~8-10 more days. N=100 takes
 ~20-22 more days. Recommend continuous paper trading through end of April
 before any live capital.
+
+---
+
+## V4 Phase 0 + Phase 1 (2026-04-16)
+
+### Context
+Two bugs observed between V3 cutover and V4 kickoff (single trade in the
+interim period), combined with the full V4 Phase-1 foundation (pipeline
+health, dynamic fees, post-only entries, observability) from the V4 upgrade
+spec. Phase 2+ gated behind a 7-day validation window on paper.
+
+### Phase 0 — pre-V4 bug fixes
+
+- **Adaptive sizing vs hard-cap mismatch** (`config.yaml`):
+  V3 tightened `max_single_market_pct` to 0.06 but `adaptive_sizing` still
+  allowed `min=0.05 / max=0.10`, so every adaptive-sized entry was rejected
+  by the risk engine as "exceeds hard cap $60 (6%)". Realigned bounds to
+  `min=0.025 / max=0.05`, centered on the 4% target and below the 6% cap.
+- **Discord webhook silent drop** (`src/notifications.py`):
+  `_post_webhook` returned False on Discord 503 without retrying — the
+  single trade since last upload had its alert silently dropped (only the
+  hourly snapshot captured it). Added 3-attempt retry with 1s/2s/4s backoff
+  for 5xx, 429 and timeouts. 4xx (except 429) is not retried. CRITICAL log
+  emitted when all attempts exhausted.
+- Data + logs wiped before restart (non-destructive: blacklist/caution
+  preserved).
+
+### Phase 1 — V4 foundation
+
+- **1.1 Pipeline health** (`src/pipeline_health.py`, new):
+  Per-scan funnel metrics (fetched → prefilter → detector → risk engine →
+  entries) persisted to `pipeline_health` table. Severity levels OK / WARNING
+  (12h dry) / CRITICAL (18h) / STARVATION (36h). Auto-relaxation stays OFF
+  by default — operator opt-in after reviewing dry-period data.
+- **1.2 Dynamic fee model** (`src/utils.py`, `src/detector.py`,
+  `src/executor.py`, `src/exit_engine.py`):
+  Replaced the flat 0.2% fee assumption with the Polymarket formula
+  `fee = C × Θ × p × (1-p)`. `calculate_taker_fee`, `calculate_maker_fee`,
+  and `estimate_round_trip_fee_rate` live in `utils.py`; scanner attaches a
+  resolved `_fee_schedule` (from `market.feeSchedule` with per-category
+  fallback) to every candidate. Net-yield gate now subtracts the true
+  round-trip fee. Positions persist `fee_schedule_json`,
+  `estimated_entry_fee`, `estimated_exit_fee` (+ `actual_*` columns to be
+  populated when live). Config block: `fees.use_dynamic_fees`,
+  `assume_entry_maker`, `assume_exit_taker`, `resolution_is_free`.
+- **1.3 Post-only limit entries** (`src/executor.py`):
+  Default `entry_strategy: post_only_ladder` walks `best_bid` →
+  `best_bid + 1 tick` → `midpoint - 1 tick`, all with `post_only=true`.
+  Failed ladders skip the entry (`allow_taker_fallback: false` by default)
+  — maker fills guaranteed, zero entry fees. Paper mode simulates an
+  instantaneous maker fill at target with zero fees so P&L accounting
+  matches live behaviour.
+- **1.4 Observability** (`src/dashboard.py`, `src/notifications.py`,
+  `main.py`):
+  Dashboard panels for pipeline health (funnel + top rejection reasons) and
+  fee attribution (V3 flat vs V4 dynamic vs savings). Daily Discord summary
+  (`send_pipeline_health_summary`) fires alongside the daily report with
+  acceptance rate, entries executed, dry period peak, top rejection, and
+  today's maker-execution fee savings.
+
+### Tests added
+
+- `tests/test_v4_phase0.py` — adaptive size ≤ hard cap (2 tests); webhook
+  retry behaviour (4 tests: retries on 503/timeout, no retry on 4xx, CRITICAL
+  log on exhaustion).
+- `tests/test_pipeline_health.py` — 8 tests: persistence, acceptance rate,
+  dry period, starvation levels, auto-relax disabled, top rejections,
+  24h summary, disabled no-ops.
+- `tests/test_dynamic_fees.py` — 6 tests: taker fee symmetric, maker fee
+  always 0, Geopolitics fee-free, resolution-is-free flag, fallback when
+  schedule missing, net-yield gate accepts fee-free and rejects high-fee.
+- `tests/test_post_only_entry.py` — 8 tests: ladder price per attempt,
+  clamp to target, paper maker simulation, ladder skips when all rejected,
+  no taker fallback when flag off, postOnly flag present in every order.
+- `tests/test_v4_observability.py` — 4 tests: dashboard panels render,
+  Discord pipeline summary includes top rejection + fee savings, disabled
+  flag no-ops.
+
+All 225 existing tests remain green; total suite size is 225 passing after
+Phase 1.
+
+### Config changes (`config.yaml`)
+
+- New `fees:` block (dynamic model on by default, maker-entry assumption).
+- New `executor:` block (post-only ladder, no taker fallback).
+- `pipeline_health:` block already installed pre-V4 sits under Phase 1.1.
+- `adaptive_sizing.min_size_pct = 0.025`, `max_size_pct = 0.05` (Phase 0 fix).
+
+### Success criteria (Phase 1)
+
+- Fee calculations match `feeSchedule` within 0.01% per trade (verified
+  analytically via unit tests; operator will manually reconcile 10 trades
+  against Polymarket's Portfolio UI after live go).
+- ≥90% of entries fill as maker (metric exposed once live).
+- Pipeline health dashboard active and starvation alerts wired.
+- No regression in acceptance rate vs V3 baseline — validated by the
+  7-day paper-trading validation window before moving to Phase 2.
+
+### Phase 2 gating
+
+Phase 2 (category-specific min yield, category entry bands, holding rewards,
+resolution-date clustering, LP-rewards preference) is explicitly **deferred**
+until 7 consecutive days of V4 Phase 1 paper data show acceptance rate ≥ V3
+baseline. The pipeline-health module is the source of truth for that gate.
+
+---
+
+## V4 Phase 2 (2026-04-23)
+
+### Context
+
+Phase 1 cleared its gate after the 7-day window: 13/13 entries filled as
+maker (zero entry fees), 87.5% win rate on closed trades, no starvation
+events. Phase 2 broadens the candidate universe (category-tuned yield/price
+gates, holding-rewards awareness) while adding a same-catalyst correlation
+cap. All new filters land behind paired feature flags — `<flag>` +
+`shadow_<flag>` — so shadow-mode logs the would-be verdict for 24h before
+enforcement is flipped on.
+
+### 2.1 Category-specific min_net_yield
+
+- `src/detector.py` — `_resolve_category_min_yield()` looks up the
+  `risk.min_net_yield_by_category` map (falls back to `_unknown`, clamped
+  at `min_net_yield - 0.005` so misconfiguration can't accept junk yields).
+- Global `min_net_yield` always enforces; the category gate runs behind
+  `category_min_yield` (or `shadow_category_min_yield` for log-only).
+- Defaults span 1.0% (Geopolitics — low vol, fee-free) to 1.7% (Crypto —
+  higher noise) in `config.yaml`.
+
+### 2.2 Category-specific entry bands
+
+- `src/scanner.py` — `_resolve_entry_band()` looks up the
+  `scanner.entry_band_by_category` map (e.g. Geopolitics {0.93, 0.985}).
+- When `category_entry_bands` is enforced the category band widens the
+  scanner's acceptance; shadow variant tallies a
+  `shadow_category_band_rescue` counter without changing behaviour.
+
+### 2.3 Holding rewards (4% APY)
+
+- `src/scanner.py` — `_attach_rewards_fields()` parses
+  `holdingRewardsEnabled` off the Gamma payload and attaches
+  `_holding_rewards_enabled` / `_holding_rewards_apr` (from
+  `holding_rewards.apy`).
+- `src/utils.py` — `estimate_holding_rewards(value, days, apr)` simple
+  interest. `calculate_bond_score()` adds the reward yield to
+  `yield_pct` when the market is eligible, behind the
+  `holding_rewards_scoring` flag.
+- DB migration adds `holding_rewards_enabled`, `holding_rewards_apr`,
+  `estimated_holding_rewards`, `actual_holding_rewards` to `positions`.
+  `update_position` allow-list extended.
+- `src/rewards_reconciler.py` (new) — daily job. Paper mode populates
+  `actual_holding_rewards` from the estimate; live-mode Data-API
+  attribution is stubbed behind `holding_rewards.reconciliation_enabled`.
+
+### 2.4 Resolution-date clustering
+
+- `src/database.py` — `get_resolution_date_exposure(iso, window_hours,
+  paper_trade)` sums `cost_basis` of open positions whose
+  `expected_resolution` falls within ±window_hours of the target.
+- `src/portfolio_manager.py` — thin passthrough.
+- `src/risk_engine.py` — new `check_resolution_date_cluster()` inserted
+  between the per-underlying cooldown and position-size check; rejects
+  entries whose addition would push >25% of deployed capital into a single
+  24h resolution window. Flag `resolution_date_cluster` with shadow
+  variant; default max pct / window in `config.yaml`.
+- `main.py` passes `market_resolution_time` (from `endDate`) into
+  `evaluate_entry`.
+
+### 2.5 LP-rewards preference
+
+- `src/scanner.py` — rewards-field parser extracts max
+  `rewardsDailyRate` from `clobRewards[]` and sets
+  `_lp_rewards_enabled` when it clears the `lp_rewards.min_daily_rate`
+  floor.
+- `src/utils.py` — `calculate_bond_score()` accepts a `lp_rewards_boost`
+  multiplier (default 1.0); scanner passes 1.15 when the flag
+  `lp_rewards_preference` is on.
+- DB migration adds `lp_rewards_enabled`, `lp_rewards_daily_rate`.
+
+### 2.6 Shadow-mode plumbing
+
+- `src/utils.py` — `shadow_enabled(cfg, flag)` checks
+  `feature_flags.shadow_<flag>`. New Phase 2 filters default to
+  `shadow_*: true`, real flag `false` — 24h of telemetry before
+  enforcement.
+
+### Observability
+
+- Discord trade alerts now include a Rewards field (Holding APY + LP
+  $/day tags) when the market is reward-eligible.
+- Discord daily report adds a "Holding Rewards" line when the stats
+  carry `holding_rewards_earned`.
+- Dashboard portfolio panel surfaces cumulative holding rewards when
+  present in the portfolio dict.
+
+### Tests added
+
+`tests/test_v4_phase2.py` — 27 tests across:
+
+- Shadow-flag resolution (`shadow_enabled`).
+- Detector category-yield resolution + hard-floor clamp.
+- Scanner entry-band resolution + shadow rescue counter + enforce widen.
+- Holding-rewards simple-interest estimate (zero-input guards).
+- Bond-score reward/LP boost + non-eligible parity.
+- Scanner `_attach_rewards_fields` (enabled/disabled/below-floor cases).
+- RewardsReconciler paper-mode actuals + skips non-eligible.
+- `get_resolution_date_exposure` windowed sum + unparseable guard.
+- Risk-engine cluster check: rejects over-25%, allows under, flag-off
+  no-op, shadow allows, missing time passes.
+
+Full suite: **286 passing**.
+
+### Config changes (`config.yaml`)
+
+- `risk.min_net_yield_by_category` map (Geopolitics 1.0% → Crypto 1.7%).
+- `risk.resolution_date_cluster_pct: 0.25` + `_window_hours: 24`.
+- `scanner.entry_band_by_category` overrides.
+- `holding_rewards:` block (apy 0.04, reconciliation off).
+- `lp_rewards:` block (score_boost 1.15, min_daily_rate 100).
+- Feature flags: real flags off, shadow variants on for the
+  validation window (holding_rewards_scoring and lp_rewards_preference
+  are boost-only and safe to enable directly).
+
+### Phase 2 gating (next)
+
+24h shadow-mode telemetry per filter, then flip `category_min_yield`,
+`category_entry_bands`, and `resolution_date_cluster` to enforce.
+Acceptance-criteria validation over the subsequent 7-day window before
+Phase 3 work begins (see `V4_upgrade_spec.md §2` for pass/fail bars).

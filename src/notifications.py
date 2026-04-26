@@ -53,37 +53,63 @@ class Notifier:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def _post_webhook(self, payload: Dict[str, Any]) -> bool:
+    async def _post_webhook(
+        self,
+        payload: Dict[str, Any],
+        max_attempts: int = 3,
+    ) -> bool:
         """
-        Send a POST request to the webhook URL.
+        Send a POST to the webhook URL with retry on transient failure.
 
-        Args:
-            payload: Discord embed payload
-
-        Returns:
-            True if sent successfully
+        Retries on 5xx responses, 429 (rate-limited), network errors, and
+        timeouts. Backoff schedule: 1s, 2s, 4s. Permanent failures (4xx
+        other than 429) are not retried. Logs CRITICAL when all attempts
+        are exhausted so dropped alerts are observable.
         """
         if not self.enabled or not self.webhook_url:
             logger.debug("Notifications disabled or no webhook URL configured")
             return False
 
-        try:
-            session = await self._get_session()
-            async with session.post(self.webhook_url, json=payload) as resp:
-                if resp.status in (200, 204):
-                    return True
-                else:
+        backoff = 1.0
+        last_reason = ""
+        for attempt in range(1, max_attempts + 1):
+            try:
+                session = await self._get_session()
+                async with session.post(self.webhook_url, json=payload) as resp:
+                    if resp.status in (200, 204):
+                        if attempt > 1:
+                            logger.info(f"Webhook delivered on attempt {attempt}")
+                        return True
+
                     body = await resp.text()
+                    last_reason = f"HTTP {resp.status}: {body[:200]}"
+                    transient = resp.status >= 500 or resp.status == 429
+                    if not transient:
+                        logger.warning(f"Webhook non-retryable: {last_reason}")
+                        return False
                     logger.warning(
-                        f"Webhook returned {resp.status}: {body[:200]}"
+                        f"Webhook attempt {attempt}/{max_attempts} failed "
+                        f"(transient): {last_reason}"
                     )
-                    return False
-        except asyncio.TimeoutError:
-            logger.error("Webhook request timed out")
-            return False
-        except Exception as e:
-            logger.error(f"Failed to send webhook: {e}")
-            return False
+            except asyncio.TimeoutError:
+                last_reason = "timeout"
+                logger.warning(
+                    f"Webhook attempt {attempt}/{max_attempts} timed out"
+                )
+            except Exception as e:
+                last_reason = f"exception: {e}"
+                logger.warning(
+                    f"Webhook attempt {attempt}/{max_attempts} failed: {e}"
+                )
+
+            if attempt < max_attempts:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+
+        logger.critical(
+            f"Webhook delivery failed after {max_attempts} attempts: {last_reason}"
+        )
+        return False
 
     def _color_for_level(self, level: str) -> int:
         """Get Discord embed color code for alert level."""
@@ -134,6 +160,21 @@ class Notifier:
             {"name": "Cost Basis", "value": f"${cost_basis:,.2f}", "inline": True},
             {"name": "Bond Score", "value": f"{bond_score:.6f}", "inline": True},
         ]
+
+        # V4 Phase 2.3/2.5: surface rewards context on entry alerts.
+        rewards_tags = []
+        if market.get("_holding_rewards_enabled") or position.get("holding_rewards_enabled"):
+            apr = market.get("_holding_rewards_apr") or position.get("holding_rewards_apr") or 0
+            rewards_tags.append(f"Holding {apr*100:.1f}% APY")
+        if market.get("_lp_rewards_enabled"):
+            rate = market.get("_lp_rewards_daily_rate", 0)
+            rewards_tags.append(f"LP ${rate:.0f}/day")
+        if rewards_tags:
+            fields.append({
+                "name": "Rewards",
+                "value": ", ".join(rewards_tags),
+                "inline": True,
+            })
 
         if position.get("expected_resolution"):
             fields.append({
@@ -328,10 +369,67 @@ class Notifier:
                 {"name": "Cash Available", "value": f"${cash_available:,.2f}", "inline": True},
             ])
 
+        # V4 Phase 2.3: cumulative holding rewards earned (estimated in paper
+        # mode, reconciled in live mode).
+        holding_rewards_total = stats.get("holding_rewards_earned")
+        if holding_rewards_total is not None:
+            fields.append({
+                "name": "Holding Rewards",
+                "value": f"${holding_rewards_total:,.2f}",
+                "inline": True,
+            })
+
         payload = {
             "embeds": [{
                 "title": f"{self._mode_tag()} Daily Report — {date}",
                 "color": color,
+                "fields": fields,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "footer": {"text": "Polymarket Bond Bot"},
+            }]
+        }
+        return await self._post_webhook(payload)
+
+    async def send_pipeline_health_summary(
+        self,
+        health_summary: Dict[str, Any],
+        fee_savings_today: Optional[float] = None,
+    ) -> bool:
+        """V4 1.4: Daily pipeline-health Discord summary.
+
+        `health_summary` mirrors PipelineHealth.get_24h_summary().
+        """
+        if not self.daily_summary:
+            return True
+
+        accept_rate = float(health_summary.get("acceptance_rate") or 0.0) * 100
+        entries = int(health_summary.get("entries") or 0)
+        dry = float(health_summary.get("dry_period_hours") or 0.0)
+        top = health_summary.get("top_rejections") or []
+        top_line = "none recorded"
+        if top:
+            reason, count = top[0]
+            total_rej = sum(c for _, c in top) or 1
+            top_line = f"{reason} ({count / total_rej * 100:.0f}%)"
+
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        fields = [
+            {"name": "Acceptance rate", "value": f"{accept_rate:.2f}%", "inline": True},
+            {"name": "Entries executed", "value": str(entries), "inline": True},
+            {"name": "Dry period", "value": f"{dry:.1f}h", "inline": True},
+            {"name": "Top rejection", "value": top_line, "inline": False},
+        ]
+        if fee_savings_today is not None:
+            fields.append({
+                "name": "Fee savings (maker)",
+                "value": f"${fee_savings_today:,.2f}",
+                "inline": True,
+            })
+
+        payload = {
+            "embeds": [{
+                "title": f"{self._mode_tag()} Pipeline Health — {date}",
+                "color": self._color_for_level("info"),
                 "fields": fields,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "footer": {"text": "Polymarket Bond Bot"},

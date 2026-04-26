@@ -287,6 +287,17 @@ def feature_enabled(config: dict, flag_name: str) -> bool:
     return config.get("feature_flags", {}).get(flag_name, False)
 
 
+def shadow_enabled(config: dict, flag_name: str) -> bool:
+    """Check if a filter's shadow variant is enabled (log verdict without enforcing).
+
+    V4 Phase 2 (spec §0.2): new filters land with `shadow_{flag}` true and the real
+    `{flag}` false. The detector/scanner/risk-engine runs the filter and records
+    verdicts in pipeline_health for operator review, but the reject is not enforced.
+    After 24h of acceptable shadow data, operator flips shadow off and real flag on.
+    """
+    return config.get("feature_flags", {}).get(f"shadow_{flag_name}", False)
+
+
 def resolution_proximity_weight(days_to_resolution: float, decay_rate: float = 0.3) -> float:
     """
     Exponential proximity weight: e^(-decay_rate * days).
@@ -432,6 +443,197 @@ def get_days_to_resolution(end_date_str: str) -> float:
     return delta.total_seconds() / 86400
 
 
+# V4 1.2: Dynamic fee model (Polymarket fee = C × Θ × p × (1-p))
+# Category peak rates per Polymarket 2026 schedule (used as fallback when
+# market.feeSchedule is missing). Keys are lowercased category names.
+_CATEGORY_PEAK_TAKER_RATE = {
+    "geopolitics": 0.0,
+    "politics": 0.010,
+    "sports": 0.0075,
+    "finance": 0.010,
+    "tech": 0.010,
+    "culture": 0.0125,
+    "weather": 0.0125,
+    "economics": 0.015,
+    "crypto": 0.018,
+    "mentions": 0.0156,
+}
+
+
+def _taker_rate_at(price: float, fee_schedule: Optional[dict]) -> float:
+    """Return the effective taker fee rate at a given price, scaled by p(1-p).
+
+    Θ is the peak taker-fee coefficient (per-unit-of-shares rate at p=0.5).
+    At p=0.5 the p(1-p) factor = 0.25, so effective rate at p=0.5 is Θ/4.
+    The formula `fee = C × Θ × p × (1-p)` returns fee in USDC for C shares,
+    so fee/notional = Θ × p × (1-p) / p = Θ × (1-p) — but the utility here
+    returns the share-space rate (fee per share) for composition with shares.
+    We keep the canonical p(1-p) form; callers multiply by shares.
+    """
+    if not fee_schedule or not fee_schedule.get("feesEnabled", True):
+        return 0.0
+    theta = fee_schedule.get("takerFeeCoefficient")
+    if theta is None:
+        bps = fee_schedule.get("takerFeeBps")
+        if bps is not None:
+            theta = float(bps) / 10000.0
+    if theta is None:
+        theta = fee_schedule.get("peakTakerFeeRate", 0.0)
+    theta = float(theta or 0.0)
+    p = max(0.01, min(0.99, float(price)))
+    return theta * p * (1.0 - p)
+
+
+def calculate_taker_fee(
+    price: float,
+    shares: float,
+    fee_schedule: Optional[dict],
+) -> float:
+    """Compute taker fee in USDC for a trade at `price` for `shares` shares.
+
+    Polymarket formula: fee = C × Θ × p × (1-p). Returns 0 if fees disabled,
+    no schedule provided, or Θ resolves to 0 (e.g. Geopolitics).
+    """
+    rate = _taker_rate_at(price, fee_schedule)
+    return float(shares) * rate
+
+
+def calculate_maker_fee(
+    price: float,
+    shares: float,
+    fee_schedule: Optional[dict],
+) -> float:
+    """Makers pay no fees on Polymarket. Kept as symmetric API."""
+    return 0.0
+
+
+def fee_schedule_from_category(
+    category: Optional[str],
+    fallback_taker_rate: float = 0.002,
+) -> dict:
+    """Synthesize a fee_schedule dict from a category name when Gamma omits one.
+
+    Uses the published 2026 peak rates. Unknown categories fall back to
+    `fallback_taker_rate` (treated as Θ, i.e. per-share rate at p=0.5).
+    """
+    cat = (category or "").strip().lower()
+    theta = _CATEGORY_PEAK_TAKER_RATE.get(cat, fallback_taker_rate)
+    return {
+        "feesEnabled": theta > 0.0,
+        "takerFeeCoefficient": theta,
+        "source": "category_fallback",
+        "category": cat,
+    }
+
+
+def estimate_round_trip_fee_rate(
+    entry_price: float,
+    exit_price: Optional[float],
+    fee_schedule: Optional[dict],
+    entry_is_maker: bool = True,
+    exit_is_taker: bool = True,
+    exit_is_resolution: bool = False,
+) -> float:
+    """Return round-trip fee as a fraction of position notional.
+
+    Used for net-yield gating. `fee_schedule` may be None — returns 0 in that
+    case (caller is expected to have supplied fallback via
+    `fee_schedule_from_category`).
+    """
+    if fee_schedule is None:
+        return 0.0
+    if not fee_schedule.get("feesEnabled", True):
+        return 0.0
+
+    entry_fee_rate = 0.0
+    if not entry_is_maker:
+        entry_fee_rate = _taker_rate_at(entry_price, fee_schedule)
+
+    exit_fee_rate = 0.0
+    if not exit_is_resolution and exit_is_taker:
+        px = exit_price if exit_price is not None else 1.0
+        exit_fee_rate = _taker_rate_at(px, fee_schedule)
+
+    return entry_fee_rate + exit_fee_rate
+
+
+def resolve_fee_schedule(market: dict, fees_cfg: dict) -> Optional[dict]:
+    """Extract feeSchedule from a Gamma market dict with category fallback.
+
+    Returns None when dynamic fees are disabled in config so callers collapse
+    to legacy flat-rate behaviour.
+    """
+    if not fees_cfg.get("use_dynamic_fees", True):
+        return None
+    fs = market.get("feeSchedule") or market.get("fee_schedule")
+    if isinstance(fs, dict) and fs:
+        if "feesEnabled" not in fs:
+            fs = {**fs, "feesEnabled": True}
+        return fs
+    category = market.get("category") or market.get("marketType")
+    fallback = fees_cfg.get("fallback_taker_rate", 0.002)
+    return fee_schedule_from_category(category, fallback_taker_rate=fallback)
+
+
+# Canonical-underlying patterns. Ordered: first match wins; specific before general.
+# Each entry is (underlying_key, regex). Used to cap concurrent exposure to any
+# single asset across different strike prices / resolution dates.
+_UNDERLYING_PATTERNS = [
+    ("BTC", r"\b(bitcoin|btc)\b"),
+    ("ETH", r"\b(ethereum|ether|eth)\b"),
+    ("SOL", r"\b(solana|sol)\b"),
+    ("XRP", r"\b(xrp|ripple)\b"),
+    ("DOGE", r"\b(dogecoin|doge)\b"),
+    ("ADA", r"\b(cardano|ada)\b"),
+    ("WTI", r"\b(wti|crude oil|oil price)\b"),
+    ("GOLD", r"\bgold\b"),
+    ("SPX", r"\b(s&p\s*500|spx|s&p)\b"),
+    ("NDX", r"\b(nasdaq)\b"),
+    ("NVDA", r"\b(nvidia|nvda)\b"),
+    ("AAPL", r"\b(apple|aapl)\b"),
+    ("MSFT", r"\b(microsoft|msft)\b"),
+    ("GOOG", r"\b(google|alphabet|goog|googl)\b"),
+    ("AMZN", r"\b(amazon|amzn)\b"),
+    ("TSLA", r"\b(tesla|tsla)\b"),
+    ("META", r"\b(facebook|meta\b|metaplatforms)"),
+    ("FED",  r"\b(fed rate|interest rate|fomc|federal reserve)\b"),
+    ("CPI",  r"\b(cpi|inflation rate)\b"),
+]
+
+
+def classify_underlying(market_question: str) -> Optional[str]:
+    """Canonicalise a market question to an underlying asset key (e.g. 'BTC').
+
+    Returns None if no specific underlying is detected. Used to cap concurrent
+    exposure and enforce cooldowns on assets that Polymarket lists as separate
+    markets but that move in lockstep (strike variants, different dates).
+    """
+    import re as _re
+    if not market_question:
+        return None
+    q = market_question.lower()
+    for key, pattern in _UNDERLYING_PATTERNS:
+        if _re.search(pattern, q):
+            return key
+    return None
+
+
+def estimate_holding_rewards(
+    position_value_usd: float,
+    days_held: float,
+    holding_rewards_apr: float = 0.04,
+) -> float:
+    """V4 Phase 2.3: expected USDC rewards for holding the position.
+
+    Polymarket emits rewards on unmatched YES balance at a fixed APY on
+    reward-eligible markets. Formula: `value * apr * days / 365`. The estimate
+    is simple-interest; daily reconciliation (live mode) populates actuals.
+    """
+    if position_value_usd <= 0 or days_held <= 0 or holding_rewards_apr <= 0:
+        return 0.0
+    return position_value_usd * holding_rewards_apr * (days_held / 365.0)
+
+
 def calculate_bond_score(
     entry_price: float,
     days_to_resolution: float,
@@ -440,6 +642,9 @@ def calculate_bond_score(
     catalyst_penalty: float = 1.0,
     blacklist_penalty: float = 1.0,
     config: Optional[dict] = None,
+    holding_rewards_enabled: bool = False,
+    holding_rewards_apr: float = 0.0,
+    lp_rewards_boost: float = 1.0,
 ) -> float:
     """
     Calculate the bond score for a market opportunity.
@@ -461,9 +666,18 @@ def calculate_bond_score(
 
     yield_pct = (1.00 - entry_price) / entry_price
 
+    # V4 Phase 2.3: holding-reward yield accrues on YES balance at 4% APY on
+    # eligible markets. Fold it into the yield term so shorter-duration
+    # reward-eligible markets don't dominate (time-to-resolve already
+    # normalizes below).
+    if holding_rewards_enabled and holding_rewards_apr > 0:
+        holding_reward_yield = holding_rewards_apr * (days_to_resolution / 365.0)
+    else:
+        holding_reward_yield = 0.0
+
     # R1: Confidence-adjusted yield — penalizes lower-confidence markets
     confidence_weight = entry_price ** 2
-    adjusted_yield = yield_pct * confidence_weight
+    adjusted_yield = (yield_pct + holding_reward_yield) * confidence_weight
 
     liquidity_weight = min(liquidity_clob / 50000.0, 1.0)
 
@@ -493,5 +707,10 @@ def calculate_bond_score(
 
     # Apply penalties from catalyst classifier and blacklist learner
     bond_score *= catalyst_penalty * blacklist_penalty
+
+    # V4 Phase 2.5: LP-rewarded markets have deeper books / tighter spreads.
+    # Caller passes 1.15 when the market qualifies, 1.0 otherwise.
+    if lp_rewards_boost and lp_rewards_boost != 1.0:
+        bond_score *= lp_rewards_boost
 
     return bond_score

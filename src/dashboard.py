@@ -122,6 +122,15 @@ class Dashboard:
             "Total Trades:", str(total_trades),
         )
 
+        # V4 Phase 2.3: cumulative holding rewards (right column only to
+        # preserve the two-col layout).
+        holding_rewards = portfolio.get("holding_rewards_earned")
+        if holding_rewards is not None:
+            table.add_row(
+                "", "",
+                "Holding Rewards:", f"${holding_rewards:,.2f}",
+            )
+
         return Panel(table, title="[bold cyan]Portfolio Summary[/bold cyan]", box=box.ROUNDED)
 
     def _make_positions_table(self, positions: List[Dict[str, Any]]) -> Panel:
@@ -248,6 +257,72 @@ class Dashboard:
         return Panel(
             table,
             title="[bold blue]Top Bond Candidates[/bold blue]",
+            box=box.ROUNDED,
+        )
+
+    def _make_pipeline_health_panel(self, health_summary: Dict[str, Any]) -> Panel:
+        """V4 1.4: Render pipeline funnel + top rejection reasons.
+
+        `health_summary` mirrors PipelineHealth.get_24h_summary().
+        """
+        fetched = int(health_summary.get("fetched") or 0)
+        prefilter = int(health_summary.get("prefilter") or 0)
+        detector = int(health_summary.get("detector") or 0)
+        risk = int(health_summary.get("risk") or 0)
+        entries = int(health_summary.get("entries") or 0)
+        accept_rate = float(health_summary.get("acceptance_rate") or 0.0) * 100
+        dry = float(health_summary.get("dry_period_hours") or 0.0)
+
+        def pct(n: int) -> str:
+            return f"({(n / fetched * 100):.2f}%)" if fetched else ""
+
+        body = Text()
+        body.append(
+            f"Scans: {int(health_summary.get('scans') or 0)}    "
+            f"Acceptance rate: {accept_rate:.2f}%\n"
+        )
+        body.append(f"Fetched: {fetched:,}   Prefilter: {prefilter:,} {pct(prefilter)}\n")
+        body.append(f"Detector: {detector:,} {pct(detector)}  RiskEng: {risk:,} {pct(risk)}\n")
+        body.append(f"Entries: {entries}    Dry period: {dry:.1f}h\n\n")
+        body.append("Top rejection reasons:\n", style="bold")
+        top = health_summary.get("top_rejections") or []
+        if top:
+            for i, (reason, count) in enumerate(top, 1):
+                body.append(f" {i}. {reason:<32} {count:,}\n", style="dim")
+        else:
+            body.append(" (none recorded)\n", style="dim")
+
+        return Panel(
+            body,
+            title="[bold cyan]Pipeline Health (24h)[/bold cyan]",
+            box=box.ROUNDED,
+        )
+
+    def _make_fee_attribution_panel(self, fee_stats: Dict[str, Any]) -> Panel:
+        """V4 1.4: Lifetime fee attribution — legacy flat vs dynamic-model.
+
+        `fee_stats` keys: position_count, gross_revenue, legacy_fees,
+        actual_fees, savings.
+        """
+        count = int(fee_stats.get("position_count") or 0)
+        gross = float(fee_stats.get("gross_revenue") or 0.0)
+        legacy = float(fee_stats.get("legacy_fees") or 0.0)
+        actual = float(fee_stats.get("actual_fees") or 0.0)
+        savings = legacy - actual
+
+        def pct_of_gross(v: float) -> str:
+            return f"({(v / gross * 100):.1f}%)" if gross > 0 else ""
+
+        body = Text()
+        body.append(f"Position count: {count}\n")
+        body.append(f"Gross revenue: ${gross:,.2f}\n")
+        body.append(f"Estimated fees (V3 flat): ${legacy:,.2f}  {pct_of_gross(legacy)}\n")
+        body.append(f"Actual fees (V4 dynamic): ${actual:,.2f}  {pct_of_gross(actual)}\n")
+        body.append(f"Savings from maker execution: ${savings:,.2f}\n", style="bold green")
+
+        return Panel(
+            body,
+            title="[bold magenta]Fee Attribution (lifetime)[/bold magenta]",
             box=box.ROUNDED,
         )
 

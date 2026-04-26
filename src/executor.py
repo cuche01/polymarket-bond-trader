@@ -3,12 +3,21 @@ Order execution module for entering and exiting positions.
 """
 
 import asyncio
+import json
 import logging
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
-from .utils import get_days_to_resolution, round_to_tick, safe_json_parse
+from .utils import (
+    calculate_maker_fee,
+    calculate_taker_fee,
+    estimate_round_trip_fee_rate,
+    get_days_to_resolution,
+    resolve_fee_schedule,
+    round_to_tick,
+    safe_json_parse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +25,29 @@ logger = logging.getLogger(__name__)
 DEFAULT_TICK_SIZE = 0.01
 # Conservative fee estimate — assumes taker fee for yield calculations
 ESTIMATED_FEE_RATE = 0.002
+
+
+def _taker_exit_fee(
+    exit_price: float,
+    shares: float,
+    position: Dict[str, Any],
+    fees_cfg: dict,
+) -> float:
+    """V4 1.2: Compute taker exit fee using the position's stored feeSchedule.
+
+    Falls back to the legacy flat ESTIMATED_FEE_RATE when the schedule is
+    missing or dynamic fees are disabled, so behaviour is backwards compatible.
+    """
+    fs_json = position.get("fee_schedule_json")
+    fee_schedule = None
+    if fs_json:
+        try:
+            fee_schedule = json.loads(fs_json) if isinstance(fs_json, str) else fs_json
+        except Exception:
+            fee_schedule = None
+    if fee_schedule and fees_cfg.get("use_dynamic_fees", True):
+        return calculate_taker_fee(exit_price, shares, fee_schedule)
+    return shares * exit_price * ESTIMATED_FEE_RATE
 
 
 class OrderExecutor:
@@ -34,6 +66,13 @@ class OrderExecutor:
         self.auto_exit_enabled = exits_cfg.get("auto_exit_enabled", True)
         risk_cfg = config.get("risk", {})
         self.min_net_yield = risk_cfg.get("min_net_yield", 0.01)
+        # V4 1.3: Post-only entry strategy
+        executor_cfg = config.get("executor", {}) or {}
+        self.entry_strategy = executor_cfg.get("entry_strategy", "post_only_ladder")
+        self.post_only_max_attempts = int(executor_cfg.get("post_only_max_attempts", 3))
+        self.post_only_retry_wait_sec = int(executor_cfg.get("post_only_retry_wait_sec", 10))
+        self.allow_taker_fallback = bool(executor_cfg.get("allow_taker_fallback", False))
+        self.default_tick_size = float(executor_cfg.get("tick_size", DEFAULT_TICK_SIZE))
 
     async def execute_entry(
         self,
@@ -76,13 +115,33 @@ class OrderExecutor:
         shares = position_size / entry_price
         shares = round(shares, 4)
 
-        # Calculate fees
-        fees = position_size * ESTIMATED_FEE_RATE
-        net_yield = ((1.0 - entry_price) / entry_price) - ESTIMATED_FEE_RATE
+        # V4 1.2: Dynamic fee model. Entries are expected to fill as maker
+        # (post-only, V4 1.3) — maker fee = 0. Round-trip estimate assumes
+        # taker exit (worst case) for the net-yield gate.
+        fees_cfg = self.config.get("fees", {}) or {}
+        fee_schedule = market.get("_fee_schedule") or resolve_fee_schedule(market, fees_cfg)
+        entry_is_maker = bool(fees_cfg.get("assume_entry_maker", True))
+        if entry_is_maker:
+            fees = calculate_maker_fee(entry_price, shares, fee_schedule)
+        else:
+            fees = calculate_taker_fee(entry_price, shares, fee_schedule)
+
+        round_trip_fee_rate = estimate_round_trip_fee_rate(
+            entry_price=entry_price,
+            exit_price=None,
+            fee_schedule=fee_schedule,
+            entry_is_maker=entry_is_maker,
+            exit_is_taker=bool(fees_cfg.get("assume_exit_taker", True)),
+            exit_is_resolution=False,
+        )
+        gross_yield = (1.0 - entry_price) / entry_price
+        net_yield = gross_yield - round_trip_fee_rate
+        estimated_exit_fee = calculate_taker_fee(1.0, shares, fee_schedule)
 
         if net_yield < self.min_net_yield:
             logger.warning(
-                f"Net yield {net_yield:.4f} below minimum {self.min_net_yield}, skipping entry"
+                f"Net yield {net_yield:.4f} below minimum {self.min_net_yield} "
+                f"(fee_rate={round_trip_fee_rate:.4f}), skipping entry"
             )
             return None
 
@@ -94,45 +153,51 @@ class OrderExecutor:
         order_id = None
 
         if paper_mode:
-            # Simulate order without hitting real API
+            # V4 1.3: Paper mode simulates post-only maker fill at target price.
+            # Maker fills pay zero entry fees (fees already set to 0 above).
             order_id = f"PAPER-{market_id[:8]}-{int(time.time())}"
-            logger.info(f"[PAPER] Simulated order placed: {order_id}")
+            logger.info(f"[PAPER] Simulated post-only maker fill: {order_id}")
         else:
-            # Place real limit order at current ask price
-            try:
-                order_args = {
-                    "token_id": yes_token_id,
-                    "price": entry_price,
-                    "size": shares,
-                    "side": "BUY",
-                }
-                response = clob_client.create_and_post_order(order_args)
-
-                if not response:
-                    logger.error(f"No response from order placement for {market_id}")
-                    return None
-
-                order_id = getattr(response, "orderID", None) or str(response)
-                logger.info(f"Order placed: {order_id} for {market_id}")
-
-                # Wait for fill
-                filled_price, filled_shares, actual_fees = await self.monitor_fill(
-                    order_id, clob_client, self.order_timeout
+            # V4 1.3: Post-only ladder when strategy is enabled; legacy taker
+            # path retained only behind explicit taker fallback flag.
+            if self.entry_strategy == "post_only_ladder":
+                result = await self._place_post_only_entry(
+                    market=market,
+                    yes_token_id=yes_token_id,
+                    entry_price_target=entry_price,
+                    shares=shares,
+                    clob_client=clob_client,
                 )
-
-                if filled_price is None:
-                    logger.warning(f"Order {order_id} not filled within timeout, cancelling")
-                    await self.cancel_order(order_id, clob_client)
+                if result is None:
                     return None
-
-                # Update with actual fill data
-                entry_price = filled_price or entry_price
-                shares = filled_shares or shares
-                fees = actual_fees or fees
-
-            except Exception as e:
-                logger.error(f"Order placement failed for {market_id}: {e}", exc_info=True)
-                return None
+                entry_price, shares, fees, order_id = result
+            else:
+                try:
+                    order_args = {
+                        "token_id": yes_token_id,
+                        "price": entry_price,
+                        "size": shares,
+                        "side": "BUY",
+                    }
+                    response = clob_client.create_and_post_order(order_args)
+                    if not response:
+                        logger.error(f"No response from order placement for {market_id}")
+                        return None
+                    order_id = getattr(response, "orderID", None) or str(response)
+                    logger.info(f"Order placed: {order_id} for {market_id}")
+                    filled_price, filled_shares, actual_fees = await self.monitor_fill(
+                        order_id, clob_client, self.order_timeout
+                    )
+                    if filled_price is None:
+                        logger.warning(f"Order {order_id} not filled within timeout, cancelling")
+                        await self.cancel_order(order_id, clob_client)
+                        return None
+                    entry_price = filled_price or entry_price
+                    shares = filled_shares or shares
+                    fees = actual_fees or fees
+                except Exception as e:
+                    logger.error(f"Order placement failed for {market_id}: {e}", exc_info=True)
+                    return None
 
         cost_basis = entry_price * shares
 
@@ -151,6 +216,10 @@ class OrderExecutor:
             "paper_trade": paper_mode,
             "order_id": order_id,
             "event_id": market.get("eventId") or market.get("event_id", ""),
+            # V4 1.2: Persist fee schedule + estimates for later reconciliation
+            "fee_schedule_json": json.dumps(fee_schedule) if fee_schedule else None,
+            "estimated_entry_fee": fees,
+            "estimated_exit_fee": estimated_exit_fee,
         }
 
         logger.info(
@@ -160,6 +229,141 @@ class OrderExecutor:
         )
 
         return position
+
+    def _compute_post_only_ladder_price(
+        self,
+        market: Dict[str, Any],
+        attempt: int,
+        target: float,
+        tick: float,
+    ) -> float:
+        """V4 1.3: Ladder prices per attempt.
+
+        0: best_bid (conservative maker — sits behind spread)
+        1: best_bid + 1 tick (aggressive maker)
+        2: midpoint - 1 tick (step into spread, last chance)
+
+        If orderbook data is absent, falls back to target ± tick offsets.
+        """
+        orderbook = market.get("_orderbook") or market.get("orderbook") or {}
+        bids = orderbook.get("bids") or []
+        asks = orderbook.get("asks") or []
+        best_bid = None
+        best_ask = None
+        try:
+            if bids:
+                best_bid = float(bids[0].get("price") if isinstance(bids[0], dict) else bids[0][0])
+            if asks:
+                best_ask = float(asks[0].get("price") if isinstance(asks[0], dict) else asks[0][0])
+        except (TypeError, ValueError, IndexError):
+            pass
+
+        if best_bid is None:
+            best_bid = target - tick
+        if best_ask is None:
+            best_ask = target
+
+        if attempt == 0:
+            price = best_bid
+        elif attempt == 1:
+            price = best_bid + tick
+        else:
+            price = ((best_bid + best_ask) / 2) - tick
+        return round_to_tick(max(tick, min(price, target)), tick)
+
+    async def _place_post_only_entry(
+        self,
+        market: Dict[str, Any],
+        yes_token_id: str,
+        entry_price_target: float,
+        shares: float,
+        clob_client: Any,
+    ) -> Optional[Tuple[float, float, float, str]]:
+        """V4 1.3: Post-only ladder for maker entry.
+
+        Returns (filled_price, filled_shares, fees, order_id) on success, or
+        None if every attempt failed. When `allow_taker_fallback` is False
+        (the default), failures mean "skip this entry" — no taker crossover.
+        """
+        tick = float(market.get("minimumTickSize") or self.default_tick_size)
+        for attempt in range(self.post_only_max_attempts):
+            price = self._compute_post_only_ladder_price(
+                market, attempt, entry_price_target, tick
+            )
+            order_args = {
+                "token_id": yes_token_id,
+                "price": price,
+                "size": shares,
+                "side": "BUY",
+                "post_only": True,
+            }
+            logger.info(
+                f"Post-only attempt {attempt + 1}/{self.post_only_max_attempts} "
+                f"for {market.get('id', '?')} at ${price:.4f}"
+            )
+            try:
+                response = clob_client.create_and_post_order(order_args)
+            except Exception as e:
+                logger.warning(f"Post-only order rejected at attempt {attempt + 1}: {e}")
+                continue
+            if not response:
+                logger.warning(f"Post-only attempt {attempt + 1}: empty response")
+                continue
+
+            status = (getattr(response, "status", "") or "").lower()
+            if status in ("rejected_would_cross", "rejected", "would_cross"):
+                logger.info(f"Post-only attempt {attempt + 1} would cross, retrying")
+                continue
+
+            order_id = getattr(response, "orderID", None) or str(response)
+            filled_price, filled_shares, actual_fees = await self.monitor_fill(
+                order_id, clob_client, self.post_only_retry_wait_sec
+            )
+            if filled_price is None:
+                logger.info(f"Post-only order {order_id} unfilled, cancelling and retrying")
+                await self.cancel_order(order_id, clob_client)
+                continue
+            # Makers never pay taker fees — ignore any fee returned by monitor_fill
+            return (
+                float(filled_price) or price,
+                float(filled_shares) or shares,
+                0.0,
+                order_id,
+            )
+
+        logger.warning(
+            f"Post-only ladder exhausted for {market.get('id', '?')}; "
+            f"{'falling back to taker' if self.allow_taker_fallback else 'skipping entry'}"
+        )
+        if not self.allow_taker_fallback:
+            return None
+
+        # Explicit taker fallback (hard-off by default, for diagnostics only)
+        try:
+            response = clob_client.create_and_post_order({
+                "token_id": yes_token_id,
+                "price": entry_price_target,
+                "size": shares,
+                "side": "BUY",
+            })
+            if not response:
+                return None
+            order_id = getattr(response, "orderID", None) or str(response)
+            filled_price, filled_shares, actual_fees = await self.monitor_fill(
+                order_id, clob_client, self.order_timeout
+            )
+            if filled_price is None:
+                await self.cancel_order(order_id, clob_client)
+                return None
+            return (
+                float(filled_price) or entry_price_target,
+                float(filled_shares) or shares,
+                float(actual_fees or 0.0),
+                order_id,
+            )
+        except Exception as e:
+            logger.error(f"Taker fallback failed: {e}", exc_info=True)
+            return None
 
     async def execute_exit(
         self,
@@ -196,7 +400,9 @@ class OrderExecutor:
         )
 
         exit_price = current_price or 1.0  # Default to resolution price
-        actual_fees = shares * exit_price * ESTIMATED_FEE_RATE
+        actual_fees = _taker_exit_fee(
+            exit_price, shares, position, self.config.get("fees", {}) or {}
+        )
 
         if paper_mode:
             # Simulate exit
@@ -437,7 +643,9 @@ class OrderExecutor:
         )
 
         exit_price = current_price or 1.0
-        actual_fees = shares_to_close * exit_price * ESTIMATED_FEE_RATE
+        actual_fees = _taker_exit_fee(
+            exit_price, shares_to_close, position, self.config.get("fees", {}) or {}
+        )
 
         if paper_mode:
             logger.info(f"[PAPER] Simulated close at ${exit_price:.4f}")

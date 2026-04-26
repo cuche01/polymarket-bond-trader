@@ -25,7 +25,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from .portfolio_manager import PortfolioManager
-from .utils import feature_enabled, get_days_to_resolution, parse_iso_datetime, safe_json_parse
+from .utils import (
+    calculate_taker_fee,
+    feature_enabled,
+    get_days_to_resolution,
+    parse_iso_datetime,
+    safe_json_parse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +100,11 @@ class ExitEngine:
         # Sort descending by min_entry so we match highest tier first
         self.tiered_stop_loss.sort(key=lambda t: t.get("min_entry", 0), reverse=True)
 
+        # V4 P1.5: Grace period before stop-loss / trailing-stop can fire.
+        # Teleportation, revalidation_failed, resolution exits are *not*
+        # suppressed — only price-action exits driven by noise are deferred.
+        self.entry_grace_period_hours = exits_cfg.get("entry_grace_period_hours", 0)
+
         # P0: Teleportation slippage protection
         teleport_cfg = config.get("teleportation", {})
         self.teleportation_max_loss_pct = teleport_cfg.get("teleportation_max_loss_pct", 0.50)
@@ -107,8 +118,10 @@ class ExitEngine:
         # P2: Post-entry re-validation
         self.revalidation_interval_hours = exits_cfg.get("revalidation_interval_hours", 4)
 
-        # P3: Exit fee optimization
+        # P3: Exit fee optimization (legacy flat rate, used as fallback only)
         self._fee_rate = 0.002
+        # V4 1.2: Dynamic fees
+        self._fees_cfg = config.get("fees", {}) or {}
 
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -356,6 +369,20 @@ class ExitEngine:
                 return tier.get("stop_loss_pct", self.stop_loss_pct)
         return self.stop_loss_pct  # fallback to default
 
+    def _in_grace_period(self, position: Dict[str, Any]) -> bool:
+        """V4 P1.5: True if position entered < entry_grace_period_hours ago."""
+        if self.entry_grace_period_hours <= 0:
+            return False
+        entry_time_str = position.get("entry_time", "")
+        if not entry_time_str:
+            return False
+        entry_time = parse_iso_datetime(entry_time_str)
+        if not entry_time:
+            return False
+        now = datetime.now(timezone.utc)
+        held_hours = (now - entry_time).total_seconds() / 3600
+        return held_hours < self.entry_grace_period_hours
+
     def check_teleportation(
         self, position: Dict[str, Any], current_price: float
     ) -> Optional[ExitDecision]:
@@ -416,9 +443,14 @@ class ExitEngine:
         """
         R2: Tiered stop-loss — tighter stops for higher-entry bonds.
         Falls back to default stop_loss_pct if no tier matches.
+        V4 P1.5: Suppressed during the initial grace period to avoid
+        transient-liquidity / spread-widening exits on bond entries.
         """
         entry_price = position.get("entry_price", 0)
         if entry_price <= 0:
+            return None
+
+        if self._in_grace_period(position):
             return None
 
         applicable_stop = self._get_tiered_stop_loss(entry_price)
@@ -442,7 +474,11 @@ class ExitEngine:
         A6: Trailing stop — activates once price >= trailing_stop_activation_price.
         Once active, tracks high-water mark and exits if price drops
         trailing_stop_distance_pct below the high-water mark.
+        V4 P1.5: Suppressed during the initial grace period.
         """
+        if self._in_grace_period(position):
+            return None
+
         high_water = position.get("high_water_mark") or 0.0
 
         # Only check activation threshold if no high-water mark has been set yet.
@@ -665,8 +701,20 @@ class ExitEngine:
         if entry_price <= 0 or shares <= 0:
             return "sell"
 
-        # Option 1: Sell now
-        sell_pnl = (current_price - entry_price) * shares - (current_price * shares * self._fee_rate)
+        # Option 1: Sell now (V4 1.2: dynamic fee if schedule available)
+        fee_schedule = None
+        fs_json = position.get("fee_schedule_json")
+        if fs_json:
+            try:
+                import json as _json
+                fee_schedule = _json.loads(fs_json) if isinstance(fs_json, str) else fs_json
+            except Exception:
+                fee_schedule = None
+        if fee_schedule and self._fees_cfg.get("use_dynamic_fees", True):
+            sell_fee = calculate_taker_fee(current_price, shares, fee_schedule)
+        else:
+            sell_fee = current_price * shares * self._fee_rate
+        sell_pnl = (current_price - entry_price) * shares - sell_fee
 
         # Option 2: Hold to resolution
         win_prob = current_price  # Market-implied probability

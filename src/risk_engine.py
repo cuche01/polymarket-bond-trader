@@ -12,7 +12,7 @@ from typing import Any, Optional, Tuple
 
 from .portfolio_manager import PortfolioManager
 from .risk_buckets import RiskBucketClassifier
-from .utils import feature_enabled
+from .utils import classify_underlying, feature_enabled, shadow_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,25 @@ class RiskEngine:
             "consecutive_loss_cooldown_hours", 6
         )
 
+        # V4 P1.5: Per-underlying concentration cap + post-stop-out cooldown.
+        # Caps concurrent positions on the same canonical asset (BTC/ETH/etc.)
+        # across strike/date variants. Cooldown is in-memory (resets on restart).
+        self.max_positions_per_underlying = risk_cfg.get(
+            "max_positions_per_underlying", 0
+        )
+        self.underlying_cooldown_hours = risk_cfg.get("underlying_cooldown_hours", 0)
+        self._underlying_stopout_at: dict = {}  # {underlying: unix_ts}
+
+        # V4 Phase 2.4: Same-catalyst resolution-date cluster cap.
+        # Prevents >25% of deployed capital resolving within any 24h window
+        # (e.g. Fed meeting day, election night) regardless of category.
+        self.resolution_cluster_pct = risk_cfg.get(
+            "resolution_date_cluster_pct", 0.25
+        )
+        self.resolution_cluster_window_hours = risk_cfg.get(
+            "resolution_date_cluster_window_hours", 24
+        )
+
         # A4: risk bucket classifier
         self.bucket_classifier = RiskBucketClassifier(config.get("risk_buckets"))
 
@@ -75,6 +94,11 @@ class RiskEngine:
 
         # Circuit breaker cooldown: timestamp when the breaker first triggered
         self._circuit_breaker_triggered_at: Optional[float] = None
+
+        # V4 Phase 2 fix: shadow-signal counters observed within a scan cycle.
+        # main.py resets these at scan_cycle start and merges into pipeline_health
+        # rejection_reasons at scan_cycle end.
+        self.shadow_signals: dict = {}
 
     # ─── P2: Adaptive position sizing ───────────────────────────────────────
 
@@ -146,6 +170,7 @@ class RiskEngine:
         clob_client: Optional[Any] = None,
         token_id: Optional[str] = None,
         days_to_resolution: float = 7.0,
+        market_resolution_time: Optional[str] = None,
     ) -> Tuple[bool, str, float]:
         """
         Run all risk checks in order. Return on first failure.
@@ -164,6 +189,13 @@ class RiskEngine:
             f"category='{category}' | question='{market_question[:80]}' | "
             f"bucket='{self.bucket_classifier.classify(category, market_question)}' | "
             f"size=${requested_size:.2f}"
+        )
+
+        # V4 Phase 2 fix: run resolution_date_cluster shadow *before* any
+        # early-return check so the signal isn't masked by the underlying cap.
+        # This only emits a log line — enforcement still happens at check 7.75.
+        self._log_shadow_resolution_cluster(
+            market_resolution_time, requested_size, balance
         )
 
         # 1. Category block (UMA dispute contagion) + V3: bucket block (fluke loss)
@@ -204,6 +236,23 @@ class RiskEngine:
         # 7. Risk bucket exposure (A4)
         ok, reason = self.check_risk_bucket_exposure(
             category, market_question, requested_size, balance
+        )
+        if not ok:
+            return False, reason, 0.0
+
+        # 7.25 V4 P1.5: Per-underlying concentration cap
+        ok, reason = self.check_underlying_exposure(market_question)
+        if not ok:
+            return False, reason, 0.0
+
+        # 7.5 V4 P1.5: Per-underlying post-stop-out cooldown
+        ok, reason = self.check_underlying_cooldown(market_question)
+        if not ok:
+            return False, reason, 0.0
+
+        # 7.75 V4 Phase 2.4: Resolution-date cluster check
+        ok, reason = self.check_resolution_date_cluster(
+            market_resolution_time, requested_size, balance
         )
         if not ok:
             return False, reason, 0.0
@@ -381,6 +430,147 @@ class RiskEngine:
                 f"Risk bucket '{bucket}' exposure {new_pct:.1%} would exceed {max_exposure:.0%}",
             )
         return True, ""
+
+    # ─── V4 P1.5: Per-underlying concentration + cooldown ────────────────────
+
+    def check_underlying_exposure(self, market_question: str) -> Tuple[bool, str]:
+        """Cap concurrent open positions on the same canonical underlying.
+
+        Counts open positions whose market_question maps to the same underlying
+        (e.g. multiple 'Bitcoin above $X on April Y' markets all map to 'BTC').
+        Skips the check when max_positions_per_underlying <= 0 or the market's
+        underlying cannot be identified.
+        """
+        if self.max_positions_per_underlying <= 0:
+            return True, ""
+        underlying = classify_underlying(market_question)
+        if not underlying:
+            return True, ""
+        try:
+            open_positions = self.portfolio.db.get_open_positions()
+        except Exception:
+            return True, ""  # Fail open (avoid blocking trades on DB hiccup)
+        n = sum(
+            1 for pos in open_positions
+            if classify_underlying(pos.get("market_question") or "") == underlying
+        )
+        if n >= self.max_positions_per_underlying:
+            return (
+                False,
+                f"Underlying '{underlying}' has {n} open positions "
+                f"(max {self.max_positions_per_underlying})",
+            )
+        return True, ""
+
+    def check_underlying_cooldown(self, market_question: str) -> Tuple[bool, str]:
+        """Reject entries on an underlying that recently suffered a stop-out."""
+        if self.underlying_cooldown_hours <= 0:
+            return True, ""
+        underlying = classify_underlying(market_question)
+        if not underlying:
+            return True, ""
+        last_ts = self._underlying_stopout_at.get(underlying)
+        if not last_ts:
+            return True, ""
+        elapsed_hours = (time.time() - last_ts) / 3600
+        if elapsed_hours >= self.underlying_cooldown_hours:
+            # Cooldown expired — clear tracker
+            self._underlying_stopout_at.pop(underlying, None)
+            return True, ""
+        remaining = self.underlying_cooldown_hours - elapsed_hours
+        return (
+            False,
+            f"Underlying '{underlying}' on stop-out cooldown "
+            f"({remaining:.1f}h remaining)",
+        )
+
+    def register_underlying_stopout(self, market_question: str) -> None:
+        """Record a stop-out / teleportation on this underlying to start cooldown."""
+        if self.underlying_cooldown_hours <= 0:
+            return
+        underlying = classify_underlying(market_question)
+        if not underlying:
+            return
+        self._underlying_stopout_at[underlying] = time.time()
+        logger.info(
+            f"Registered stop-out cooldown for '{underlying}' "
+            f"({self.underlying_cooldown_hours}h)"
+        )
+
+    def check_resolution_date_cluster(
+        self,
+        resolution_time_iso: Optional[str],
+        requested_size: float,
+        portfolio_balance: float,
+    ) -> Tuple[bool, str]:
+        """V4 Phase 2.4: reject if adding this position would push >25% of
+        portfolio into any 24h resolution window (same-catalyst correlation).
+
+        Gated by feature flag `resolution_date_cluster`. The shadow-mode log
+        is emitted by :meth:`_log_shadow_resolution_cluster` earlier in
+        evaluate_entry — this method only handles enforcement so it isn't
+        masked by upstream early-returns.
+        """
+        enforce = feature_enabled(self.config, "resolution_date_cluster")
+        if not enforce:
+            return True, "ok"
+        if not resolution_time_iso:
+            return True, "ok"
+        if portfolio_balance <= 0:
+            return True, "ok"
+
+        same_window = self.portfolio.get_resolution_date_exposure(
+            resolution_time_iso,
+            window_hours=self.resolution_cluster_window_hours,
+        )
+        total_after = same_window + requested_size
+        pct_after = total_after / portfolio_balance
+
+        if pct_after > self.resolution_cluster_pct:
+            msg = (
+                f"Resolution-date cluster: ${total_after:,.0f} "
+                f"({pct_after:.1%}) would resolve within "
+                f"{self.resolution_cluster_window_hours}h of {resolution_time_iso} "
+                f"(max {self.resolution_cluster_pct:.0%})"
+            )
+            return False, msg
+        return True, "ok"
+
+    def _log_shadow_resolution_cluster(
+        self,
+        resolution_time_iso: Optional[str],
+        requested_size: float,
+        portfolio_balance: float,
+    ) -> None:
+        """V4 Phase 2 fix: emit the shadow-mode log *before* any early-return
+        risk check can mask it. Pure log side-effect, no return value.
+        """
+        if not shadow_enabled(self.config, "resolution_date_cluster"):
+            return
+        if feature_enabled(self.config, "resolution_date_cluster"):
+            return  # enforce path handles it downstream; avoid duplicate logs
+        if not resolution_time_iso or portfolio_balance <= 0:
+            return
+        try:
+            same_window = self.portfolio.get_resolution_date_exposure(
+                resolution_time_iso,
+                window_hours=self.resolution_cluster_window_hours,
+            )
+        except Exception as exc:
+            logger.debug(f"shadow resolution_date_cluster lookup failed: {exc}")
+            return
+        total_after = same_window + requested_size
+        pct_after = total_after / portfolio_balance
+        if pct_after > self.resolution_cluster_pct:
+            logger.info(
+                f"[SHADOW resolution_date_cluster] would reject: "
+                f"${total_after:,.0f} ({pct_after:.1%}) would resolve within "
+                f"{self.resolution_cluster_window_hours}h of "
+                f"{resolution_time_iso} (max {self.resolution_cluster_pct:.0%})"
+            )
+            self.shadow_signals["resolution_date_cluster"] = (
+                self.shadow_signals.get("resolution_date_cluster", 0) + 1
+            )
 
     def check_position_size(
         self, requested_size: float, portfolio_balance: float
