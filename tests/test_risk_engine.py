@@ -17,7 +17,9 @@ def _make_engine(
     category_exposure=0.0,
     event_exposure=0.0,
     bucket_exposure=0.0,
+    drawdown_pct=0.0,
     config_overrides=None,
+    exits_overrides=None,
 ):
     """Build a RiskEngine with mocked PortfolioManager."""
     config = {
@@ -32,10 +34,13 @@ def _make_engine(
             "max_slippage_pct": 0.02,
             "volume_size_max_pct": 0.02,
             "min_viable_position": 50.0,
-        }
+        },
+        "exits": {},
     }
     if config_overrides:
         config["risk"].update(config_overrides)
+    if exits_overrides:
+        config["exits"].update(exits_overrides)
 
     portfolio = MagicMock(spec=PortfolioManager)
     portfolio.get_portfolio_balance.return_value = balance
@@ -45,6 +50,7 @@ def _make_engine(
     portfolio.get_category_exposure.return_value = category_exposure
     portfolio.get_event_group_exposure.return_value = event_exposure
     portfolio.get_risk_bucket_exposure.return_value = bucket_exposure
+    portfolio.get_portfolio_drawdown_pct.return_value = drawdown_pct
     # V3: Bucket confidence scaling mock — assume proven bucket by default
     portfolio.get_bucket_statistics.return_value = {
         "closed_count": 5, "total_pnl": 10.0, "avg_pnl": 2.0,
@@ -116,6 +122,75 @@ class TestRiskEngineCategoryExposure(unittest.TestCase):
         engine = _make_engine(balance=10000.0, category_exposure=1500.0)
         ok, reason = engine.check_category_exposure("Politics", 200.0, 10000.0)
         self.assertTrue(ok)
+
+    def test_per_category_override_tightens_crypto_cap(self):
+        """Bug 3 fix: Crypto override at 0.15 rejects what global 0.20 would accept."""
+        engine = _make_engine(
+            balance=10000.0,
+            category_exposure=1400.0,
+            config_overrides={
+                "max_category_exposure_pct_by_category": {"Crypto": 0.15},
+            },
+        )
+        # Crypto at 14%, new 2% → total 16% > Crypto-specific 15% cap
+        ok, reason = engine.check_category_exposure("Crypto", 200.0, 10000.0)
+        self.assertFalse(ok)
+        self.assertIn("Crypto", reason)
+        self.assertIn("15%", reason)
+
+    def test_per_category_override_does_not_affect_other_categories(self):
+        """Bug 3 fix: Crypto override doesn't apply to Politics."""
+        engine = _make_engine(
+            balance=10000.0,
+            category_exposure=1700.0,
+            config_overrides={
+                "max_category_exposure_pct_by_category": {"Crypto": 0.15},
+            },
+        )
+        # Politics at 17%, new 2% = 19% within global 20% cap
+        ok, reason = engine.check_category_exposure("Politics", 200.0, 10000.0)
+        self.assertTrue(ok)
+
+
+class TestRiskEngineDrawdownHalt(unittest.TestCase):
+
+    def test_evaluate_entry_blocked_when_drawdown_at_halt(self):
+        """Bug 2 fix: drawdown ≥ halt threshold pauses new entries."""
+        engine = _make_engine(
+            balance=10000.0,
+            drawdown_pct=-0.06,
+            exits_overrides={"drawdown_entry_halt_pct": 0.05},
+        )
+        approved, reason, _ = engine.evaluate_entry(
+            market_id="m1", category="Crypto", event_group_id="g1",
+            requested_size=100.0, entry_price=0.97,
+        )
+        self.assertFalse(approved)
+        self.assertIn("drawdown", reason.lower())
+
+    def test_evaluate_entry_passes_when_drawdown_under_halt(self):
+        """Bug 2 fix: small drawdown does not block."""
+        engine = _make_engine(
+            balance=10000.0,
+            drawdown_pct=-0.02,
+            exits_overrides={"drawdown_entry_halt_pct": 0.05},
+        )
+        # Bypass other guard fixtures by using a tiny size
+        approved, reason, _ = engine.evaluate_entry(
+            market_id="m1", category="Crypto", event_group_id="g1",
+            requested_size=100.0, entry_price=0.97,
+        )
+        # Drawdown halt should not be the rejection reason here
+        self.assertNotIn("drawdown", reason.lower())
+
+    def test_evaluate_entry_halt_disabled_by_default(self):
+        """Bug 2 fix: when halt_pct=0, the gate is dormant."""
+        engine = _make_engine(balance=10000.0, drawdown_pct=-0.10)
+        approved, reason, _ = engine.evaluate_entry(
+            market_id="m1", category="Crypto", event_group_id="g1",
+            requested_size=100.0, entry_price=0.97,
+        )
+        self.assertNotIn("drawdown", reason.lower())
 
 
 class TestRiskEngineEventGroup(unittest.TestCase):
