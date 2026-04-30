@@ -348,6 +348,7 @@ class BondBot:
                         or market.get("end_date_iso")
                         or market.get("gameStartTime")
                     ),
+                    open_positions=self._open_positions,
                 )
 
                 if not approved:
