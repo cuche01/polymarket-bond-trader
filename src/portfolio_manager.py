@@ -26,6 +26,10 @@ class PortfolioManager:
         self._portfolio_balance: float = 0.0
         self._peak_portfolio_value: float = 0.0
         self._paper_mode: bool = False
+        # Bug 1 fix (2026-04-30): timestamp of last drawdown_reduction trigger.
+        # Used by ExitEngine to enforce a cooldown between triggers, so a single
+        # cascade event can't fire close-1-weakest every monitor cycle.
+        self._last_drawdown_reduction_at: Optional[float] = None
 
     def set_portfolio_balance(self, balance: float, paper_mode: bool = False) -> None:
         """
@@ -150,6 +154,14 @@ class PortfolioManager:
 
         sorted_positions = sorted(open_positions, key=unrealized_pct)
         return sorted_positions[:n]
+
+    # ─── Drawdown trigger cooldown (Bug 1 fix) ────────────────────────────────
+
+    def get_last_drawdown_reduction_at(self) -> Optional[float]:
+        return self._last_drawdown_reduction_at
+
+    def mark_drawdown_reduction(self, ts: float) -> None:
+        self._last_drawdown_reduction_at = ts
 
     # ─── High-water mark ──────────────────────────────────────────────────────
 
