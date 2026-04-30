@@ -85,6 +85,10 @@ class ExitEngine:
         self.partial_close_pct = exits_cfg.get("partial_close_pct", 0.50)
         self.portfolio_drawdown_alert_pct = exits_cfg.get("portfolio_drawdown_alert_pct", 0.03)
         self.portfolio_drawdown_critical_pct = exits_cfg.get("portfolio_drawdown_critical_pct", 0.05)
+        # Bug 1 fix: cooldown so a permanent drawdown-vs-peak doesn't fire every cycle.
+        self.drawdown_reduction_cooldown_hours = exits_cfg.get(
+            "drawdown_reduction_cooldown_hours", 6
+        )
 
         self.yellow_loss_pct = alerts_cfg.get("yellow_loss_pct", 0.03)
         self.orange_loss_pct = alerts_cfg.get("orange_loss_pct", 0.05)
@@ -771,21 +775,32 @@ class ExitEngine:
     ) -> List[Tuple[Dict[str, Any], ExitDecision]]:
         """
         Portfolio-wide drawdown reduction:
-        - At -3%: close the single worst-performing position
-        - At -5%: close the bottom 3 positions
-        Returns list of (position, decision) pairs.
+        - At alert_pct: close the single worst-performing position
+        - At critical_pct: close the bottom 3 positions
+
+        Bug 1 fix (2026-04-30): respect a cooldown after each trigger. The peak
+        is monotonic, so a single cascade event can leave drawdown permanently
+        beyond the threshold; firing every monitor cycle (60s) caused 89 churn
+        trades. Cooldown means we trim once and wait — if drawdown deepens past
+        critical the cooldown is bypassed.
         """
         drawdown = self.portfolio.get_portfolio_drawdown_pct(open_positions)
 
         if drawdown >= 0 or abs(drawdown) < self.portfolio_drawdown_alert_pct:
             return []
 
-        if abs(drawdown) >= self.portfolio_drawdown_critical_pct:
-            n_to_close = 3
-            level = "CRITICAL"
-        else:
-            n_to_close = 1
-            level = "ALERT"
+        is_critical = abs(drawdown) >= self.portfolio_drawdown_critical_pct
+
+        # Cooldown gate — only suppress at ALERT level. CRITICAL still fires.
+        if not is_critical and self.drawdown_reduction_cooldown_hours > 0:
+            last_at = self.portfolio.get_last_drawdown_reduction_at()
+            if last_at is not None:
+                elapsed_h = (time.time() - last_at) / 3600.0
+                if elapsed_h < self.drawdown_reduction_cooldown_hours:
+                    return []
+
+        n_to_close = 3 if is_critical else 1
+        level = "CRITICAL" if is_critical else "ALERT"
 
         weakest = self.portfolio.get_weakest_positions(n_to_close, open_positions)
         if not weakest:
@@ -795,6 +810,7 @@ class ExitEngine:
             f"PORTFOLIO DRAWDOWN {level}: {drawdown:.2%} — "
             f"closing {len(weakest)} weakest position(s)"
         )
+        self.portfolio.mark_drawdown_reduction(time.time())
 
         return [
             (
