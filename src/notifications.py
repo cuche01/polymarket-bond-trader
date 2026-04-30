@@ -144,6 +144,13 @@ class Notifier:
         if not self.alert_on_trade:
             return True
 
+        # Bug 5 fix (2026-04-30): suppress Discord noise from drawdown_reduction
+        # closures. The operator already gets the PORTFOLIO DRAWDOWN warning log
+        # and per-cycle close notifications would flood the channel during a
+        # cascade event.
+        if position.get("exit_reason") == "drawdown_reduction":
+            return True
+
         action = "OPENED" if position.get("status") == "open" else "CLOSED"
         entry_price = position.get("entry_price", 0)
         shares = position.get("shares", 0)
