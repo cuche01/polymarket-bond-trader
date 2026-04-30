@@ -44,7 +44,15 @@ class RiskEngine:
         self.target_position_pct = risk_cfg.get("target_position_pct", 0.03)
         self.max_correlated_pct = risk_cfg.get("max_correlated_pct", 0.15)
         self.max_category_exposure_pct = risk_cfg.get("max_category_exposure_pct", 0.20)
+        # Bug 3 fix (2026-04-30): per-category exposure override map. Crypto cap
+        # at 20% prevents BTC/ETH simultaneous-stop-out cascades.
+        self.max_category_exposure_pct_by_category = risk_cfg.get(
+            "max_category_exposure_pct_by_category", {}
+        ) or {}
         self.max_deployed_pct = risk_cfg.get("max_deployed_pct", 0.70)
+        # Bug 2 fix: while |portfolio drawdown| ≥ this, halt new entries entirely.
+        exits_cfg = config.get("exits", {})
+        self.drawdown_entry_halt_pct = exits_cfg.get("drawdown_entry_halt_pct", 0.0)
         self.max_daily_loss_pct = risk_cfg.get("max_daily_loss_pct", 0.02)
         self.consecutive_loss_halt = risk_cfg.get("consecutive_loss_halt", 3)
         self.max_slippage_pct = risk_cfg.get("max_slippage_pct", 0.02)
@@ -171,6 +179,7 @@ class RiskEngine:
         token_id: Optional[str] = None,
         days_to_resolution: float = 7.0,
         market_resolution_time: Optional[str] = None,
+        open_positions: Optional[list] = None,
     ) -> Tuple[bool, str, float]:
         """
         Run all risk checks in order. Return on first failure.
@@ -207,6 +216,17 @@ class RiskEngine:
         ok, reason = self.check_category_blocked(bucket_name)
         if not ok:
             return False, reason, 0.0
+
+        # 1.5 Bug 2 fix (2026-04-30): halt new entries while in drawdown.
+        # Without this, the scanner kept opening positions for the drawdown_reduction
+        # loop to immediately close — 89 churn trades on 2026-04-30.
+        if self.drawdown_entry_halt_pct > 0:
+            dd = self.portfolio.get_portfolio_drawdown_pct(open_positions or [])
+            if dd < 0 and abs(dd) >= self.drawdown_entry_halt_pct:
+                return False, (
+                    f"Portfolio drawdown {dd:.2%} ≥ halt threshold "
+                    f"{self.drawdown_entry_halt_pct:.2%} — entries paused"
+                ), 0.0
 
         # 2. Daily loss limit
         ok, reason = self.check_daily_loss_limit(balance)
@@ -377,16 +397,22 @@ class RiskEngine:
     def check_category_exposure(
         self, category: str, position_size: float, portfolio_balance: float
     ) -> Tuple[bool, str]:
-        """Enforce max 20% portfolio exposure per Polymarket category."""
+        """Enforce per-category portfolio exposure cap.
+
+        Uses the per-category override map first (e.g., Crypto: 0.20), falling
+        back to the global ``max_category_exposure_pct``.
+        """
         if not category or portfolio_balance <= 0:
             return True, ""
+        cap = self.max_category_exposure_pct_by_category.get(
+            category, self.max_category_exposure_pct
+        )
         current = self.portfolio.get_category_exposure(category)
         new_pct = (current + position_size) / portfolio_balance
-        if new_pct > self.max_category_exposure_pct:
+        if new_pct > cap:
             return (
                 False,
-                f"Category '{category}' exposure {new_pct:.1%} would exceed "
-                f"{self.max_category_exposure_pct:.0%}",
+                f"Category '{category}' exposure {new_pct:.1%} would exceed {cap:.0%}",
             )
         return True, ""
 
