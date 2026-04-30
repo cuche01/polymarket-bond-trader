@@ -39,6 +39,9 @@ def _make_engine(config_overrides=None):
     portfolio.get_weakest_positions.return_value = []
     portfolio.update_high_water_mark.return_value = None
     portfolio.update_position_status.return_value = None
+    # Bug 1 fix: drawdown trigger cooldown
+    portfolio.get_last_drawdown_reduction_at.return_value = None
+    portfolio.mark_drawdown_reduction.return_value = None
 
     risk_engine = MagicMock()
     engine = ExitEngine(config, portfolio, risk_engine, notifier=None)
@@ -189,6 +192,40 @@ class TestPortfolioDrawdown(unittest.TestCase):
         portfolio.get_portfolio_drawdown_pct.return_value = 0.01
         decisions = engine.check_portfolio_drawdown([])
         self.assertEqual(len(decisions), 0)
+
+    def test_alert_drawdown_suppressed_during_cooldown(self):
+        """Bug 1 fix: ALERT-level drawdown does not refire within cooldown window."""
+        import time
+        engine, portfolio = _make_engine()
+        pos = _make_position(entry_price=0.97, current_price=0.90)
+        portfolio.get_portfolio_drawdown_pct.return_value = -0.035
+        portfolio.get_weakest_positions.return_value = [pos]
+        # Last trigger 1h ago; cooldown is 6h
+        portfolio.get_last_drawdown_reduction_at.return_value = time.time() - 3600
+        decisions = engine.check_portfolio_drawdown([pos])
+        self.assertEqual(decisions, [])
+
+    def test_critical_drawdown_bypasses_cooldown(self):
+        """Bug 1 fix: CRITICAL drawdown still fires even within cooldown."""
+        import time
+        engine, portfolio = _make_engine()
+        positions = [_make_position(entry_price=0.97, current_price=0.85, position_id=i)
+                     for i in range(3)]
+        portfolio.get_portfolio_drawdown_pct.return_value = -0.06
+        portfolio.get_weakest_positions.return_value = positions
+        portfolio.get_last_drawdown_reduction_at.return_value = time.time() - 60
+        decisions = engine.check_portfolio_drawdown(positions)
+        self.assertEqual(len(decisions), 3)
+
+    def test_drawdown_marks_timestamp_on_trigger(self):
+        """Bug 1 fix: triggering drawdown reduction records timestamp."""
+        engine, portfolio = _make_engine()
+        pos = _make_position(entry_price=0.97, current_price=0.90)
+        portfolio.get_portfolio_drawdown_pct.return_value = -0.035
+        portfolio.get_weakest_positions.return_value = [pos]
+        portfolio.get_last_drawdown_reduction_at.return_value = None
+        engine.check_portfolio_drawdown([pos])
+        portfolio.mark_drawdown_reduction.assert_called_once()
 
 
 class TestTrailingStop(unittest.TestCase):
