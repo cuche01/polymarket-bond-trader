@@ -38,7 +38,11 @@ risk:
   max_single_market_pct: 0.06        # V3: Hard cap 6% (was 12%)
   target_position_pct: 0.04          # V3: Target 4% (was 8%) — ~quarter Kelly for n=18
   max_correlated_pct: 0.25          # Max 25% in same event group
-  max_category_exposure_pct: 0.35   # Max 35% in same Polymarket category
+  max_category_exposure_pct: 0.35   # Default — overridden by per-category map below
+  # Per-category exposure overrides. Crypto tightened to 0.20 after 2026-04-28
+  # cascade (4 BTC/ETH bonds teleportation-stopped within 4 minutes).
+  max_category_exposure_pct_by_category:
+    Crypto: 0.20
   max_deployed_pct: 0.80            # Max 80% total deployment
   max_absolute_position: 5000       # Hard cap in USDC
   max_daily_loss_pct: 0.05          # Halt new entries if daily losses >= 5%
@@ -66,7 +70,7 @@ risk:
     Weather: 0.014        # subjective ("did it rain") — UMA-prone
     Economics: 0.015      # Fed/CPI clustering — multi-bond catalyst risk
     Mentions: 0.018       # highly subjective ("did X say Y") — UMA-prone
-    Crypto: 0.020         # highest fees + price volatility
+    Crypto: 0.025         # highest fees + price volatility; tightened 2026-04-28 after ETH 0.97 entry stop-loss (-7.32%)
     _unknown: 0.015       # defensive default for un-tagged markets
 
   # V4 Phase 2.4: Resolution-date clustering cap — reject if adding this position
@@ -128,6 +132,13 @@ exits:
   # Portfolio-level exits
   portfolio_drawdown_alert_pct: 0.05    # Close worst position at -5% drawdown
   portfolio_drawdown_critical_pct: 0.08 # Close bottom 3 positions at -8%
+  # Cooldown between drawdown_reduction triggers. Without this, a single
+  # cascade event creates a permanent drawdown vs all-time peak that fires
+  # every monitor cycle (60s) — observed 2026-04-30 producing 89 churn trades.
+  drawdown_reduction_cooldown_hours: 6
+  # While |drawdown| ≥ this, the risk engine halts new entries entirely.
+  # Mirrors the alert threshold so we stop digging during a real drawdown.
+  drawdown_entry_halt_pct: 0.05
   portfolio_profit_taking_enabled: false
   portfolio_profit_taking_pct: 0.03
 
