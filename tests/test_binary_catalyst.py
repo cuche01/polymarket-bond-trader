@@ -87,5 +87,82 @@ class TestBinaryCatalystClassifier(unittest.TestCase):
         self.assertIn("Catalyst:", reason) if passed else self.assertIn("rejected", reason.lower())
 
 
+class TestBinaryCatalystCategorySkip(unittest.TestCase):
+    """Option A: scheduled-resolution categories bypass L4.5 reject (still penalize)."""
+
+    def test_politics_election_passes_with_penalty(self):
+        """Politics 'Will X win' (score=1.0) is allowed-with-penalty, not rejected."""
+        detector = _make_detector()
+        market = {
+            "question": "Will Reform UK win the most council seat elections in 2026?",
+            "description": "",
+            "category": "Politics",
+        }
+        passed, reason = detector._check_binary_catalyst(market)
+        self.assertTrue(passed, f"Politics binary should pass with penalty, got: {reason}")
+        self.assertEqual(market["_catalyst_penalty"], 0.60)
+
+    def test_economics_fomc_passes_with_penalty(self):
+        """Economics 'No change in BoJ rates after meeting' passes with penalty."""
+        detector = _make_detector()
+        market = {
+            "question": "No change in Bank of Japan's interest rates after the April 2026 meeting?",
+            "description": "Decision expected at the policy announcement.",
+            "category": "Economics",
+        }
+        passed, reason = detector._check_binary_catalyst(market)
+        self.assertTrue(passed, f"Economics binary should pass with penalty, got: {reason}")
+
+    def test_finance_earnings_passes_with_penalty(self):
+        """Finance 'Will AMZN beat earnings' passes with penalty."""
+        detector = _make_detector()
+        market = {
+            "question": "Will Amazon (AMZN) beat quarterly earnings?",
+            "description": "",
+            "category": "Finance",
+        }
+        passed, reason = detector._check_binary_catalyst(market)
+        self.assertTrue(passed, f"Finance binary should pass with penalty, got: {reason}")
+
+    def test_non_whitelisted_category_still_rejects(self):
+        """Mentions / unknown categories still get the hard reject."""
+        detector = _make_detector()
+        market = {
+            "question": "Will Trump tweet about the verdict and announce a new policy?",
+            "description": "",
+            "category": "Mentions",
+        }
+        passed, reason = detector._check_binary_catalyst(market)
+        self.assertFalse(passed, f"Mentions binary should still reject, got: {reason}")
+        self.assertIn("rejected", reason.lower())
+
+    def test_category_skip_list_overridable(self):
+        """Operator can override skip-list via config."""
+        detector = _make_detector({
+            "binary_catalyst": {
+                "binary_catalyst_reject_threshold": 0.85,
+                "binary_catalyst_penalize_threshold": 0.50,
+                "binary_catalyst_penalty_factor": 0.60,
+                "binary_catalyst_reject_skip_categories": ["Politics"],  # only Politics
+            }
+        })
+        # Politics: bypass
+        m_politics = {
+            "question": "Will X win the election?",
+            "description": "",
+            "category": "Politics",
+        }
+        passed, _ = detector._check_binary_catalyst(m_politics)
+        self.assertTrue(passed)
+        # Economics: now rejects (not in custom list)
+        m_economics = {
+            "question": "Will the Fed announce a rate decision and ruling on policy?",
+            "description": "",
+            "category": "Economics",
+        }
+        passed, reason = detector._check_binary_catalyst(m_economics)
+        self.assertFalse(passed)
+
+
 if __name__ == "__main__":
     unittest.main()
