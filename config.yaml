@@ -50,7 +50,7 @@ risk:
   consecutive_loss_cooldown_hours: 6 # Resume trading after N hours of circuit breaker
   max_slippage_pct: 0.03            # Reject if estimated entry slippage > 3%
   volume_size_max_pct: 0.05         # Max 5% of 24h volume per position (A5)
-  min_viable_position: 15           # Minimum position worth taking (USDC)
+  min_viable_position: 12           # Minimum position worth taking (USDC) — lowered from 15 to unlock cold-start bucket-scaled trades (~$13.9-14.9 cluster)
   min_net_yield: 0.010              # Global floor; per-category gates below add risk-adjusted overlays
 
   # V4 Phase 2.1: Category-specific min net yield. Global gate is permissive
