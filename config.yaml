@@ -212,6 +212,17 @@ binary_catalyst:
   binary_catalyst_reject_threshold: 0.85
   binary_catalyst_penalize_threshold: 0.50
   binary_catalyst_penalty_factor: 0.60
+  # Categories with scheduled, predictable resolution catalysts (elections,
+  # FOMC meetings, Eurovision, earnings calls). Bonds held to resolution in
+  # these categories don't suffer surprise teleportation, so the L4.5 reject
+  # is downgraded to penalize for them. Categories NOT in this list (e.g.,
+  # Mentions, Tech, Sports already excluded at scanner) keep the hard reject.
+  binary_catalyst_reject_skip_categories:
+    - Politics
+    - Geopolitics
+    - Economics
+    - Culture
+    - Finance
 
 # P1: Price drop cool-down
 detector:
