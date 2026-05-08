@@ -77,6 +77,17 @@ class PseudoCertaintyDetector:
         self.binary_reject_threshold = catalyst_cfg.get("binary_catalyst_reject_threshold", 0.85)
         self.binary_penalize_threshold = catalyst_cfg.get("binary_catalyst_penalize_threshold", 0.50)
         self.binary_penalty_factor = catalyst_cfg.get("binary_catalyst_penalty_factor", 0.60)
+        # Categories with scheduled, predictable resolution catalysts (elections,
+        # FOMC, Eurovision, earnings calls). Held-to-resolution bonds in these
+        # categories don't suffer surprise teleportation, so L4.5 reject is
+        # downgraded to penalize for them. Filter still rejects for unscheduled
+        # categories (Mentions, etc.).
+        self.binary_catalyst_reject_skip_categories = set(
+            catalyst_cfg.get(
+                "binary_catalyst_reject_skip_categories",
+                ["Politics", "Geopolitics", "Economics", "Culture", "Finance"],
+            )
+        )
 
         # P1: Price drop cool-down
         detector_cfg = config.get("detector", {})
@@ -476,17 +487,28 @@ class PseudoCertaintyDetector:
         - reject:   binary_score >= 0.85 (pure binary catalyst)
         - penalize: binary_score >= 0.50 (mixed — reduce bond score)
         - allow:    binary_score < 0.50 (continuous decay — safe for bonds)
+
+        Categories listed in `binary_catalyst_reject_skip_categories` (Politics,
+        Geopolitics, Economics, Culture, Finance by default) have scheduled
+        resolution dates and bond-strategy-compatible decay; for them, "reject"
+        is downgraded to "penalize" so we still discount the bond score but
+        don't kill viable elections/earnings/FOMC bonds.
         """
         question = market.get("question") or market.get("title") or ""
         description = market.get("description") or ""
+        category = market.get("category") or market.get("marketType") or ""
 
         result = self._classify_catalyst_type(question, description)
 
         if result["recommendation"] == "reject":
-            return False, (
-                f"Binary catalyst rejected (score={result['binary_score']:.2f}, "
-                f"binary={result['matched_binary']}, continuous={result['matched_continuous']})"
-            )
+            if category in self.binary_catalyst_reject_skip_categories:
+                # Downgrade to penalize for scheduled-resolution categories
+                result["recommendation"] = "penalize"
+            else:
+                return False, (
+                    f"Binary catalyst rejected (score={result['binary_score']:.2f}, "
+                    f"binary={result['matched_binary']}, continuous={result['matched_continuous']})"
+                )
 
         if result["recommendation"] == "penalize":
             market["_catalyst_penalty"] = self.binary_penalty_factor
