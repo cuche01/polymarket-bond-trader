@@ -522,6 +522,11 @@ class BondBot:
                         self.risk_engine.register_underlying_stopout(
                             position.get("market_question") or ""
                         )
+                        # Per-market_id cooldown — catches Politics/event
+                        # markets that classify_underlying() can't resolve.
+                        self.risk_engine.register_market_stopout(
+                            position.get("market_id") or ""
+                        )
                     # Flag teleportation exits in DB
                     if decision.reason.startswith("teleportation"):
                         self.db.update_position(position.get("id"), {"teleportation_flag": 1})
