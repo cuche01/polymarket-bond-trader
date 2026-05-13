@@ -89,6 +89,13 @@ risk:
   # during regime shifts).
   underlying_cooldown_hours: 6
 
+  # Per-market_id cooldown — catches recidivism when a bond stops out and the
+  # *exact same market* is re-bought hours later. The underlying cooldown above
+  # is keyed by canonical asset (BTC/ETH/FOMC/...) and misses Politics / event
+  # markets like "Powell out as Fed Chair" or "Will X attend Y", which is how
+  # the same Powell market hit stop-loss twice in 9h on 2026-05-12.
+  market_cooldown_hours: 24
+
 exits:
   # Stop loss
   stop_loss_pct: 0.10               # Default stop-loss (overridden by tiered below)
