@@ -140,6 +140,7 @@ def _make_risk_engine(
     balance=1000.0,
     max_per_underlying=2,
     cooldown_hours=6,
+    market_cooldown_hours=0,
     open_positions=None,
 ):
     config = {
@@ -156,6 +157,7 @@ def _make_risk_engine(
             "min_viable_position": 15.0,
             "max_positions_per_underlying": max_per_underlying,
             "underlying_cooldown_hours": cooldown_hours,
+            "market_cooldown_hours": market_cooldown_hours,
         }
     }
     portfolio = MagicMock()
@@ -259,6 +261,51 @@ class TestUnderlyingCooldown(unittest.TestCase):
         engine.register_underlying_stopout("Will Bitcoin hit $70k?")
         self.assertEqual(engine._underlying_stopout_at, {})
         ok, _ = engine.check_underlying_cooldown("Will Bitcoin hit $72k?")
+        self.assertTrue(ok)
+
+
+# ─── Per-market_id cooldown (Politics/event recidivism guard) ───────────────
+
+class TestMarketCooldown(unittest.TestCase):
+    def test_no_cooldown_when_never_stopped_out(self):
+        engine = _make_risk_engine(market_cooldown_hours=24)
+        ok, _ = engine.check_market_cooldown("market-2099881")
+        self.assertTrue(ok)
+
+    def test_rejects_re_entry_on_same_market(self):
+        engine = _make_risk_engine(market_cooldown_hours=24)
+        engine.register_market_stopout("market-2099881")
+        ok, reason = engine.check_market_cooldown("market-2099881")
+        self.assertFalse(ok)
+        self.assertIn("2099881", reason)
+        self.assertIn("cooldown", reason.lower())
+
+    def test_allows_entry_after_cooldown_elapses(self):
+        engine = _make_risk_engine(market_cooldown_hours=24)
+        engine.register_market_stopout("market-2099881")
+        engine._market_stopout_at["market-2099881"] = time.time() - 25 * 3600
+        ok, _ = engine.check_market_cooldown("market-2099881")
+        self.assertTrue(ok)
+        self.assertNotIn("market-2099881", engine._market_stopout_at)
+
+    def test_cooldown_per_market_id(self):
+        """Stop-out on one Powell market shouldn't block a different Powell market."""
+        engine = _make_risk_engine(market_cooldown_hours=24)
+        engine.register_market_stopout("market-2099881")
+        ok, _ = engine.check_market_cooldown("market-1999844")
+        self.assertTrue(ok)
+
+    def test_register_ignores_empty_market_id(self):
+        engine = _make_risk_engine(market_cooldown_hours=24)
+        engine.register_market_stopout("")
+        engine.register_market_stopout(None)
+        self.assertEqual(engine._market_stopout_at, {})
+
+    def test_cooldown_disabled_when_zero(self):
+        engine = _make_risk_engine(market_cooldown_hours=0)
+        engine.register_market_stopout("market-2099881")
+        self.assertEqual(engine._market_stopout_at, {})
+        ok, _ = engine.check_market_cooldown("market-2099881")
         self.assertTrue(ok)
 
 
