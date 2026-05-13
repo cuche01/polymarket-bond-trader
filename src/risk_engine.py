@@ -72,6 +72,12 @@ class RiskEngine:
         self.underlying_cooldown_hours = risk_cfg.get("underlying_cooldown_hours", 0)
         self._underlying_stopout_at: dict = {}  # {underlying: unix_ts}
 
+        # Per-market_id cooldown — fires when classify_underlying() returns
+        # None (Politics, event markets, "Will X attend Y" bonds) so the
+        # exact same market can't be re-bought within hours of a stop-out.
+        self.market_cooldown_hours = risk_cfg.get("market_cooldown_hours", 0)
+        self._market_stopout_at: dict = {}  # {market_id: unix_ts}
+
         # V4 Phase 2.4: Same-catalyst resolution-date cluster cap.
         # Prevents >25% of deployed capital resolving within any 24h window
         # (e.g. Fed meeting day, election night) regardless of category.
@@ -267,6 +273,12 @@ class RiskEngine:
 
         # 7.5 V4 P1.5: Per-underlying post-stop-out cooldown
         ok, reason = self.check_underlying_cooldown(market_question)
+        if not ok:
+            return False, reason, 0.0
+
+        # 7.6 Per-market_id post-stop-out cooldown (Politics/event markets
+        # that don't map to a canonical underlying).
+        ok, reason = self.check_market_cooldown(market_id)
         if not ok:
             return False, reason, 0.0
 
@@ -521,6 +533,34 @@ class RiskEngine:
         logger.info(
             f"Registered stop-out cooldown for '{underlying}' "
             f"({self.underlying_cooldown_hours}h)"
+        )
+
+    def check_market_cooldown(self, market_id: str) -> Tuple[bool, str]:
+        """Reject entries on a market_id that recently suffered a stop-out."""
+        if self.market_cooldown_hours <= 0 or not market_id:
+            return True, ""
+        last_ts = self._market_stopout_at.get(market_id)
+        if not last_ts:
+            return True, ""
+        elapsed_hours = (time.time() - last_ts) / 3600
+        if elapsed_hours >= self.market_cooldown_hours:
+            self._market_stopout_at.pop(market_id, None)
+            return True, ""
+        remaining = self.market_cooldown_hours - elapsed_hours
+        return (
+            False,
+            f"Market '{market_id}' on stop-out cooldown "
+            f"({remaining:.1f}h remaining)",
+        )
+
+    def register_market_stopout(self, market_id: str) -> None:
+        """Record a stop-out on this market_id to start cooldown."""
+        if self.market_cooldown_hours <= 0 or not market_id:
+            return
+        self._market_stopout_at[market_id] = time.time()
+        logger.info(
+            f"Registered stop-out cooldown for market '{market_id}' "
+            f"({self.market_cooldown_hours}h)"
         )
 
     def check_resolution_date_cluster(
